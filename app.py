@@ -340,7 +340,15 @@ def configurar_webhook():
     correrla salvo que cambie la URL del servicio."""
     if not TELEGRAM_BOT_TOKEN:
         return jsonify({"ok": False, "error": "TELEGRAM_BOT_TOKEN no configurado"}), 400
-    url_publica = request.url_root.rstrip("/") + "/webhook"
+    # request.url_root arma la URL con el protocolo que Flask ve POR
+    # DENTRO del contenedor -- y Railway (como casi cualquier plataforma
+    # con proxy/balanceador delante) le entrega el trafico al contenedor
+    # como http:// plano, aunque hacia afuera la URL publica sea https://.
+    # Sin esto, Telegram rechaza el webhook con "An HTTPS URL must be
+    # provided" -- se fuerza https:// a mano, ya que Railway SIEMPRE
+    # expone sus dominios *.up.railway.app en https.
+    host_sin_protocolo = request.url_root.split("://", 1)[-1].rstrip("/")
+    url_publica = f"https://{host_sin_protocolo}/webhook"
     try:
         resp = req_lib.post(f"{API_TELEGRAM}/setWebhook", json={"url": url_publica}, timeout=10)
         _configurar_comandos()
