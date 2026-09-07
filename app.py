@@ -1,0 +1,354 @@
+# -*- coding: utf-8 -*-
+"""
+Bot de Telegram — avisos del Extractor de Documentos Digitales
+============================================================
+Servicio PEQUEÑO Y SEPARADO del Extractor -- vive en su propio Railway,
+corriendo todo el tiempo (a diferencia del Extractor, este NO debe
+dormirse nunca, para poder recibir avisos y responder preguntas a
+cualquier hora).
+
+Qué hace:
+  1. Recibe avisos del Extractor (Local, .exe o Railway) en /aviso,
+     cuando un lote arranca o termina -- los guarda en memoria.
+  2. Recibe mensajes de Telegram en /webhook (cuando le escribes
+     /estado, o le das clic a un botón).
+  3. Responde:
+     - Si hay 0 lotes activos: "no hay ningún proceso corriendo".
+     - Si hay 1 solo: responde directo con el estado.
+     - Si hay 2+ : muestra botones para elegir cuál, y responde
+       el que elijas.
+  4. Cuando le llega un aviso de "terminado", manda un mensaje
+     AUTOMÁTICO sin que preguntes -- incluye un resumen y avisa fuerte
+     si hubo muchos errores.
+
+Variables de entorno necesarias (se configuran en Railway):
+  TELEGRAM_BOT_TOKEN   -- el token que te dio BotFather
+  TELEGRAM_CHAT_ID     -- tu chat_id personal (a quién avisarle)
+  TELEGRAM_AVISO_TOKEN -- una clave inventada por ti, compartida con el
+                          Extractor -- para que nadie más pueda mandarle
+                          avisos falsos a este bot.
+  UMBRAL_ERRORES_ALERTA (opcional, default 20) -- si el % de error de
+                          un lote terminado supera esto, el aviso
+                          automático se marca como alerta.
+
+Arranque: gunicorn --workers 1 --threads 4 --bind 0.0.0.0:$PORT app:app
+"""
+import os
+import json
+import time
+import threading
+from pathlib import Path
+from datetime import datetime
+
+import requests as req_lib
+from flask import Flask, request, jsonify
+
+app = Flask(__name__)
+
+# ─────────────────────────────────────────────────────────────
+# Configuración (variables de entorno)
+# ─────────────────────────────────────────────────────────────
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+TELEGRAM_AVISO_TOKEN = os.environ.get("TELEGRAM_AVISO_TOKEN", "")
+UMBRAL_ERRORES_ALERTA = float(os.environ.get("UMBRAL_ERRORES_ALERTA", "20"))
+
+API_TELEGRAM = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
+
+if not TELEGRAM_BOT_TOKEN:
+    print("[arranque] AVISO: TELEGRAM_BOT_TOKEN no está configurado -- "
+          "el bot no podrá mandar ni recibir mensajes de Telegram.", flush=True)
+
+
+# ─────────────────────────────────────────────────────────────
+# Estado en memoria -- "lotes activos" (uno por cada clave_lote distinta)
+# ─────────────────────────────────────────────────────────────
+# Se guarda también en disco (estado_lotes.json) para no perder todo si
+# Railway reinicia el servicio -- pero la fuente de verdad al responder
+# preguntas es siempre lo último que haya en memoria.
+LOCK = threading.Lock()
+LOTES = {}  # clave_lote -> dict con toda la info del último aviso recibido
+
+ARCHIVO_ESTADO = Path(__file__).resolve().parent / "estado_lotes.json"
+
+
+def _cargar_estado_disco():
+    global LOTES
+    if ARCHIVO_ESTADO.exists():
+        try:
+            with open(ARCHIVO_ESTADO, "r", encoding="utf-8") as f:
+                LOTES.update(json.load(f))
+            print(f"[arranque] {len(LOTES)} lote(s) recuperados de estado_lotes.json", flush=True)
+        except Exception as e:
+            print(f"[arranque] no se pudo leer estado_lotes.json: {e}", flush=True)
+
+
+def _guardar_estado_disco():
+    try:
+        with open(ARCHIVO_ESTADO, "w", encoding="utf-8") as f:
+            json.dump(LOTES, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"[estado] no se pudo guardar estado_lotes.json: {e}", flush=True)
+
+
+_cargar_estado_disco()
+
+
+# ─────────────────────────────────────────────────────────────
+# Utilidades para hablar con la API de Telegram
+# ─────────────────────────────────────────────────────────────
+def _enviar_mensaje(texto: str, botones=None):
+    """Manda un mensaje al chat configurado. `botones` es una lista de
+    (texto_boton, callback_data) para armar un teclado inline -- se usa
+    para el "¿cuál lote?" cuando hay varios activos."""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("[telegram] no configurado, no se puede enviar:", texto[:80], flush=True)
+        return
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": texto,
+        "parse_mode": "HTML",
+    }
+    if botones:
+        payload["reply_markup"] = json.dumps({
+            "inline_keyboard": [[{"text": t, "callback_data": d}] for t, d in botones]
+        })
+    try:
+        req_lib.post(f"{API_TELEGRAM}/sendMessage", json=payload, timeout=10)
+    except Exception as e:
+        print(f"[telegram] error enviando mensaje: {e}", flush=True)
+
+
+def _responder_callback(callback_query_id: str):
+    """Le dice a Telegram 'ya procesé el clic del botón' -- sin esto,
+    el botón se queda con el relojito de 'cargando' en el celular."""
+    try:
+        req_lib.post(f"{API_TELEGRAM}/answerCallbackQuery",
+                      json={"callback_query_id": callback_query_id}, timeout=5)
+    except Exception:
+        pass
+
+
+def _configurar_comandos():
+    """Le dice a Telegram qué comandos mostrar como sugerencia cuando el
+    usuario escribe "/" en el chat -- puramente cosmético/de usabilidad,
+    no cambia qué es capaz de responder el bot (eso lo decide
+    `_es_pregunta_de_estado` más abajo)."""
+    if not TELEGRAM_BOT_TOKEN:
+        return
+    comandos = [
+        {"command": "estado", "description": "Ver cómo va el proceso ahora mismo"},
+        {"command": "help", "description": "Ver qué le puedes preguntar a este bot"},
+    ]
+    try:
+        req_lib.post(f"{API_TELEGRAM}/setMyCommands", json={"commands": comandos}, timeout=10)
+    except Exception as e:
+        print(f"[telegram] no se pudo configurar el menú de comandos: {e}", flush=True)
+
+
+# Palabras sueltas que, en cualquier combinación dentro del mensaje,
+# hacen que se interprete como "pregunta por el estado" -- SIN llegar a
+# ser interpretación de lenguaje natural real: es una lista fija de
+# palabras clave, revisada con un chequeo simple de texto. Si el
+# mensaje no contiene ninguna de estas, cae al mensaje de "no entendí".
+_PALABRAS_CLAVE_ESTADO = (
+    "estado", "avance", "proceso", "procesos", "progreso",
+    "como vas", "cómo vas", "como va", "cómo va", "que tal", "qué tal",
+    "listo", "termino", "terminó", "llevas", "cuanto va", "cuánto va",
+)
+
+
+def _es_pregunta_de_estado(texto: str) -> bool:
+    """True si el texto (ya en minúsculas) parece estar preguntando por
+    el avance -- ya sea el comando exacto /estado, o cualquier mensaje
+    que contenga alguna de las palabras clave de arriba."""
+    if texto in ("/estado",):
+        return True
+    return any(palabra in texto for palabra in _PALABRAS_CLAVE_ESTADO)
+
+
+# ─────────────────────────────────────────────────────────────
+# Armar el texto de estado de un lote
+# ─────────────────────────────────────────────────────────────
+def _etiqueta_lote(info: dict) -> str:
+    """Ej: 'CM · Baru · 200 casos' -- lo que se ve en los botones y en
+    los mensajes, para identificar de cuál lote se está hablando."""
+    empresa = info.get("empresa") or "?"
+    servidor = info.get("servidor") or "?"
+    total = info.get("total_casos") or info.get("stats", {}).get("total") or "?"
+    return f"{empresa} · {servidor} · {total} casos"
+
+
+def _texto_estado(clave_lote: str) -> str:
+    info = LOTES.get(clave_lote)
+    if not info:
+        return "No tengo información de ese lote."
+
+    stats = info.get("stats", {})
+    total = stats.get("total", 0)
+    ok = stats.get("ok", 0)
+    err = stats.get("err", 0)
+    procesados = ok + err
+    pct = round(procesados / total * 100, 1) if total else 0
+
+    lineas = [
+        f"<b>{_etiqueta_lote(info)}</b>",
+        f"Fuente: {info.get('fuente', '?')}",
+        f"Usuario: {info.get('usuario', '?')}",
+        "",
+    ]
+    if info.get("evento") == "terminado":
+        if info.get("detenido"):
+            lineas.append("⏸ <b>Detenido por el usuario</b>")
+        elif info.get("error_general"):
+            lineas.append(f"⚠️ <b>Terminó con error:</b> {info['error_general']}")
+        else:
+            lineas.append("✅ <b>Terminado</b>")
+    else:
+        lineas.append("🔄 <b>En proceso</b>")
+
+    lineas.append(f"Avance: {procesados} / {total} ({pct}%)")
+    lineas.append(f"OK: {ok} · Error: {err}")
+    ultima = info.get("_ultima_actualizacion")
+    if ultima:
+        lineas.append(f"\n<i>Última actualización: {ultima}</i>")
+    return "\n".join(lineas)
+
+
+def _lotes_activos_recientes(horas=48):
+    """Lotes de los que se tiene noticia en las últimas N horas -- para
+    no ofrecer para siempre un lote de hace 2 semanas que ya nadie
+    recuerda."""
+    ahora = time.time()
+    activos = {}
+    for clave, info in LOTES.items():
+        ts = info.get("_timestamp", 0)
+        if ahora - ts <= horas * 3600:
+            activos[clave] = info
+    return activos
+
+
+# ─────────────────────────────────────────────────────────────
+# Endpoint: recibe avisos del Extractor
+# ─────────────────────────────────────────────────────────────
+@app.route("/aviso", methods=["POST"])
+def recibir_aviso():
+    datos = request.get_json(silent=True) or {}
+
+    if TELEGRAM_AVISO_TOKEN and datos.get("token") != TELEGRAM_AVISO_TOKEN:
+        return jsonify({"ok": False, "error": "token inválido"}), 403
+
+    clave_lote = datos.get("clave_lote")
+    if not clave_lote:
+        return jsonify({"ok": False, "error": "falta clave_lote"}), 400
+
+    with LOCK:
+        info = LOTES.get(clave_lote, {})
+        info.update(datos)
+        info["_timestamp"] = time.time()
+        info["_ultima_actualizacion"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        LOTES[clave_lote] = info
+        _guardar_estado_disco()
+
+    # Aviso AUTOMÁTICO cuando el lote termina -- sin que el usuario
+    # tenga que preguntar nada.
+    if datos.get("evento") == "terminado":
+        stats = datos.get("stats", {})
+        total = stats.get("total", 0)
+        err = stats.get("err", 0)
+        pct_error = (err / total * 100) if total else 0
+
+        if datos.get("detenido"):
+            encabezado = "⏸ <b>Lote detenido por el usuario</b>"
+        elif datos.get("error_general"):
+            encabezado = "🛑 <b>Lote terminó con error general</b>"
+        elif pct_error >= UMBRAL_ERRORES_ALERTA:
+            encabezado = f"⚠️ <b>Lote terminado — {pct_error:.0f}% de error, revisa</b>"
+        else:
+            encabezado = "✅ <b>Lote terminado</b>"
+
+        _enviar_mensaje(f"{encabezado}\n\n{_texto_estado(clave_lote)}")
+
+    return jsonify({"ok": True})
+
+
+# ─────────────────────────────────────────────────────────────
+# Endpoint: webhook de Telegram (mensajes y clics de botones)
+# ─────────────────────────────────────────────────────────────
+@app.route("/webhook", methods=["POST"])
+def webhook_telegram():
+    update = request.get_json(silent=True) or {}
+
+    # Clic en un botón ("¿cuál lote?")
+    if "callback_query" in update:
+        cq = update["callback_query"]
+        clave_lote = cq.get("data", "")
+        _responder_callback(cq["id"])
+        _enviar_mensaje(_texto_estado(clave_lote))
+        return jsonify({"ok": True})
+
+    # Mensaje de texto normal
+    mensaje = update.get("message", {})
+    texto = (mensaje.get("text") or "").strip().lower()
+
+    if texto in ("/start", "/help", "/ayuda"):
+        _enviar_mensaje(
+            "👋 Hola, soy el bot de avisos del Extractor de Documentos Digitales.\n\n"
+            "<b>Lo que me puedes preguntar:</b>\n"
+            "/estado — o simplemente escribe algo como \"¿cómo vas?\", \"avance\" "
+            "o \"cómo va el proceso\" — te digo el estado ahora mismo.\n\n"
+            "También te aviso <b>sin que preguntes nada</b> cuando un lote termina "
+            "(y te marco una alerta si tuvo muchos errores)."
+        )
+        return jsonify({"ok": True})
+
+    if _es_pregunta_de_estado(texto):
+        activos = _lotes_activos_recientes()
+        if not activos:
+            _enviar_mensaje("No tengo ningún proceso activo o reciente registrado.")
+        elif len(activos) == 1:
+            (unica_clave,) = activos.keys()
+            _enviar_mensaje(_texto_estado(unica_clave))
+        else:
+            botones = [(_etiqueta_lote(info), clave) for clave, info in activos.items()]
+            _enviar_mensaje("¿Cuál lote quieres consultar?", botones=botones)
+        return jsonify({"ok": True})
+
+    _enviar_mensaje("No entendí ese mensaje. Escribe /estado para ver el avance.")
+    return jsonify({"ok": True})
+
+
+# ─────────────────────────────────────────────────────────────
+# Endpoints de salud / configuración
+# ─────────────────────────────────────────────────────────────
+@app.route("/")
+def salud():
+    return jsonify({
+        "ok": True,
+        "servicio": "Bot de Telegram - Extractor de Documentos Digitales",
+        "telegram_configurado": bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID),
+        "lotes_en_memoria": len(LOTES),
+    })
+
+
+@app.route("/configurar-webhook")
+def configurar_webhook():
+    """Visita esta URL UNA VEZ (desde el navegador) después de desplegar,
+    para decirle a Telegram dónde mandar los mensajes que te escriban Y
+    para configurar el menú de comandos (/estado, /help) que aparece
+    como sugerencia al escribir "/" en el chat. No hace falta volver a
+    correrla salvo que cambie la URL del servicio."""
+    if not TELEGRAM_BOT_TOKEN:
+        return jsonify({"ok": False, "error": "TELEGRAM_BOT_TOKEN no configurado"}), 400
+    url_publica = request.url_root.rstrip("/") + "/webhook"
+    try:
+        resp = req_lib.post(f"{API_TELEGRAM}/setWebhook", json={"url": url_publica}, timeout=10)
+        _configurar_comandos()
+        return jsonify({"ok": True, "webhook_configurado_en": url_publica, "respuesta_telegram": resp.json()})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+if __name__ == "__main__":
+    puerto = int(os.environ.get("PORT", 8080))
+    app.run(host="0.0.0.0", port=puerto, debug=False)
