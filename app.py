@@ -242,6 +242,27 @@ def recibir_aviso():
     if not clave_lote:
         return jsonify({"ok": False, "error": "falta clave_lote"}), 400
 
+    # Caso especial: "borrado" -- cuando alguien le da al botón "Borrar
+    # progreso" en el Extractor, ese lote deja de existir DE VERDAD, no
+    # es solo "otro estado más" -- por eso se ELIMINA de la lista de
+    # lotes activos (en vez de actualizarlo con datos.update, que lo
+    # dejaría ahí mostrando "en proceso" o "terminado" para siempre,
+    # aunque ya no exista nada que consultar). Sin esto, preguntar
+    # "/estado" después de borrar un progreso seguiría mostrando el
+    # último dato viejo, como si el lote siguiera vivo.
+    if datos.get("evento") == "borrado":
+        with LOCK:
+            info_borrada = LOTES.pop(clave_lote, None)
+            _guardar_estado_disco()
+        if info_borrada:
+            _enviar_mensaje(
+                f"🗑 <b>Progreso borrado</b>\n\n"
+                f"<b>{_etiqueta_lote({**info_borrada, **datos})}</b>\n"
+                f"Fuente: {datos.get('fuente', info_borrada.get('fuente', '?'))}\n\n"
+                f"Ya no hay ningún proceso activo para este lote."
+            )
+        return jsonify({"ok": True})
+
     with LOCK:
         info = LOTES.get(clave_lote, {})
         info.update(datos)
