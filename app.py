@@ -214,6 +214,7 @@ def _configurar_comandos():
         return
     comandos = [
         {"command": "estado", "description": "Ver cómo va el proceso ahora mismo"},
+        {"command": "eliminar", "description": "Borrar de la lista un lote ya terminado"},
         {"command": "help", "description": "Ver qué le puedes preguntar a este bot"},
     ]
     try:
@@ -289,6 +290,21 @@ def _texto_estado(clave_lote: str) -> str:
     if ultima:
         lineas.append(f"\n<i>Última actualización: {ultima}</i>")
     return "\n".join(lineas)
+
+
+def _lotes_terminados_recientes(horas=48):
+    """Igual que `_lotes_activos_recientes`, pero solo los que YA
+    terminaron (evento == "terminado") -- se usa para /eliminar, porque
+    a propósito NO se permite borrar un lote que sigue "en proceso" (si
+    de verdad se quedó atascado, lo correcto es revisarlo en el
+    Extractor, no simplemente esconderlo del bot)."""
+    ahora = time.time()
+    terminados = {}
+    for clave, info in LOTES.items():
+        ts = info.get("_timestamp", 0)
+        if ahora - ts <= horas * 3600 and info.get("evento") == "terminado":
+            terminados[clave] = info
+    return terminados
 
 
 def _lotes_activos_recientes(horas=48):
@@ -380,10 +396,32 @@ def webhook_telegram():
     # dio clic, tomado del propio callback_query (no de un fijo).
     if "callback_query" in update:
         cq = update["callback_query"]
-        clave_lote = cq.get("data", "")
+        data = cq.get("data", "")
         chat_id = cq.get("message", {}).get("chat", {}).get("id")
         _responder_callback(cq["id"])
-        _enviar_mensaje(chat_id, _texto_estado(clave_lote))
+
+        # El prefijo decide la acción: "ver:<clave>" (botones de /estado,
+        # ya existía) o "borrar:<clave>" (botones nuevos de /eliminar).
+        # Cualquier dato viejo sin prefijo (de un despliegue anterior a
+        # este cambio) se trata como "ver", para no romper botones que
+        # ya estuvieran mostrados en chats antiguos al momento de
+        # actualizar el bot.
+        if data.startswith("borrar:"):
+            clave_lote = data[len("borrar:"):]
+            with LOCK:
+                info_borrada = LOTES.pop(clave_lote, None)
+                if info_borrada:
+                    _guardar_estado_disco()
+            if info_borrada:
+                _enviar_mensaje(
+                    chat_id,
+                    f"🗑 <b>Eliminado de la lista</b>\n\n<b>{_etiqueta_lote(info_borrada)}</b>"
+                )
+            else:
+                _enviar_mensaje(chat_id, "Ese lote ya no estaba en la lista (puede que alguien más ya lo haya eliminado).")
+        else:
+            clave_lote = data[len("ver:"):] if data.startswith("ver:") else data
+            _enviar_mensaje(chat_id, _texto_estado(clave_lote))
         return jsonify({"ok": True})
 
     # Mensaje de texto normal -- el chat_id de quien escribió viene en
@@ -414,7 +452,8 @@ def webhook_telegram():
             f"{saludo_registro}"
             "<b>Lo que me puedes preguntar:</b>\n"
             "/estado — o simplemente escribe algo como \"¿cómo vas?\", \"avance\" "
-            "o \"cómo va el proceso\" — te digo el estado ahora mismo.\n\n"
+            "o \"cómo va el proceso\" — te digo el estado ahora mismo.\n"
+            "/eliminar — borra de la lista un lote que YA terminó (no uno que sigue en proceso).\n\n"
             "También te aviso <b>sin que preguntes nada</b> cuando un lote termina "
             "(y te marco una alerta si tuvo muchos errores)."
         )
@@ -428,8 +467,22 @@ def webhook_telegram():
             (unica_clave,) = activos.keys()
             _enviar_mensaje(chat_id, _texto_estado(unica_clave))
         else:
-            botones = [(_etiqueta_lote(info), clave) for clave, info in activos.items()]
+            botones = [(_etiqueta_lote(info), f"ver:{clave}") for clave, info in activos.items()]
             _enviar_mensaje(chat_id, "¿Cuál lote quieres consultar?", botones=botones)
+        return jsonify({"ok": True})
+
+    if texto in ("/eliminar", "/borrar", "/limpiar"):
+        # A propósito, solo ofrece lotes YA TERMINADOS -- uno que sigue
+        # "en proceso" no se deja eliminar desde aquí, ni aunque parezca
+        # atascado; si de verdad se quedó colgado, lo correcto es
+        # revisarlo en el Extractor (ahí vive el progreso real), no
+        # simplemente esconderlo de la lista del bot.
+        terminados = _lotes_terminados_recientes()
+        if not terminados:
+            _enviar_mensaje(chat_id, "No tengo ningún lote terminado para eliminar ahora mismo.")
+        else:
+            botones = [(_etiqueta_lote(info), f"borrar:{clave}") for clave, info in terminados.items()]
+            _enviar_mensaje(chat_id, "¿Cuál lote terminado quieres eliminar de la lista?", botones=botones)
         return jsonify({"ok": True})
 
     _enviar_mensaje(chat_id, "No entendí ese mensaje. Escribe /estado para ver el avance.")

@@ -91,6 +91,9 @@ distinto en cada una, para identificarlas).
 - Cuando un lote termina, te avisa **sin que preguntes nada** — y si el porcentaje de
   error supera el umbral configurado, el aviso viene marcado como alerta.
 - `/help` (o `/start`) te recuerda en cualquier momento qué le puedes preguntar.
+- `/eliminar` te deja borrar de la lista un lote que **ya terminó** (con botones para
+  elegir cuál) — un lote que sigue "en proceso" no se puede eliminar desde aquí, a
+  propósito: si de verdad se quedó atascado, hay que revisarlo en el Extractor.
 
 ## Notas de seguridad
 
