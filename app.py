@@ -38,7 +38,7 @@ import json
 import time
 import threading
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 
 import requests as req_lib
 from flask import Flask, request, jsonify
@@ -54,6 +54,20 @@ TELEGRAM_AVISO_TOKEN = os.environ.get("TELEGRAM_AVISO_TOKEN", "")
 UMBRAL_ERRORES_ALERTA = float(os.environ.get("UMBRAL_ERRORES_ALERTA", "20"))
 
 API_TELEGRAM = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
+
+# Railway corre los contenedores en hora UTC, sin importar dónde esté el
+# usuario -- sin esto, "Última actualización" salía ~5 horas ADELANTADA
+# respecto a la hora real de Colombia (ej. decía 15:50 cuando en
+# Colombia eran las 10:52). Se fuerza a mano a UTC-5 (hora de Colombia,
+# que no tiene horario de verano, así que este offset fijo es correcto
+# todo el año) en vez de usar datetime.now() sin más, que toma la hora
+# del sistema del contenedor -- esa es UTC en Railway, no la del
+# usuario.
+ZONA_HORARIA_COLOMBIA = timezone(timedelta(hours=-5))
+
+
+def _ahora_colombia() -> datetime:
+    return datetime.now(ZONA_HORARIA_COLOMBIA)
 
 if not TELEGRAM_BOT_TOKEN:
     print("[arranque] AVISO: TELEGRAM_BOT_TOKEN no está configurado -- "
@@ -359,7 +373,7 @@ def recibir_aviso():
         info = LOTES.get(clave_lote, {})
         info.update(datos)
         info["_timestamp"] = time.time()
-        info["_ultima_actualizacion"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        info["_ultima_actualizacion"] = _ahora_colombia().strftime("%Y-%m-%d %H:%M:%S")
         LOTES[clave_lote] = info
         _guardar_estado_disco()
 
