@@ -62,14 +62,31 @@ if not TELEGRAM_BOT_TOKEN:
 
 # ─────────────────────────────────────────────────────────────
 # Estado en memoria -- "lotes activos" (uno por cada clave_lote distinta)
+# y "usuarios registrados" (todo chat_id que haya escrito /start)
 # ─────────────────────────────────────────────────────────────
-# Se guarda también en disco (estado_lotes.json) para no perder todo si
-# Railway reinicia el servicio -- pero la fuente de verdad al responder
-# preguntas es siempre lo último que haya en memoria.
+# Se guarda también en disco (estado_lotes.json / usuarios_registrados.json)
+# para no perder nada si Railway reinicia el servicio -- pero la fuente
+# de verdad al responder preguntas es siempre lo último que haya en
+# memoria.
 LOCK = threading.Lock()
 LOTES = {}  # clave_lote -> dict con toda la info del último aviso recibido
 
+# ANTES: el bot solo mandaba mensajes a un TELEGRAM_CHAT_ID fijo (una
+# sola persona, puesto a mano como variable de entorno) -- esto causaba
+# 2 problemas reales: (1) aunque otra persona le escribiera /estado al
+# bot, la respuesta igual le llegaba SOLO al dueño del chat_id fijo,
+# nunca a quien preguntó; (2) no había forma de que varias personas
+# recibieran los avisos automáticos de "lote terminado".
+#
+# AHORA: cualquiera que le escriba /start al bot queda REGISTRADO (su
+# chat_id se guarda aquí) -- las respuestas a preguntas van siempre al
+# chat de quien preguntó (eso ya lo hace Telegram por sí solo, con el
+# chat_id que viene en cada mensaje), y los avisos AUTOMÁTICOS (lote
+# terminado) se mandan a TODOS los chat_id registrados, no a uno fijo.
+USUARIOS_REGISTRADOS = set()  # conjunto de chat_id (como string)
+
 ARCHIVO_ESTADO = Path(__file__).resolve().parent / "estado_lotes.json"
+ARCHIVO_USUARIOS = Path(__file__).resolve().parent / "usuarios_registrados.json"
 
 
 def _cargar_estado_disco():
@@ -91,21 +108,62 @@ def _guardar_estado_disco():
         print(f"[estado] no se pudo guardar estado_lotes.json: {e}", flush=True)
 
 
+def _cargar_usuarios_disco():
+    global USUARIOS_REGISTRADOS
+    if ARCHIVO_USUARIOS.exists():
+        try:
+            with open(ARCHIVO_USUARIOS, "r", encoding="utf-8") as f:
+                USUARIOS_REGISTRADOS.update(json.load(f))
+            print(f"[arranque] {len(USUARIOS_REGISTRADOS)} usuario(s) registrados recuperados", flush=True)
+        except Exception as e:
+            print(f"[arranque] no se pudo leer usuarios_registrados.json: {e}", flush=True)
+
+
+def _guardar_usuarios_disco():
+    try:
+        with open(ARCHIVO_USUARIOS, "w", encoding="utf-8") as f:
+            json.dump(sorted(USUARIOS_REGISTRADOS), f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"[estado] no se pudo guardar usuarios_registrados.json: {e}", flush=True)
+
+
+def _registrar_usuario(chat_id):
+    """Agrega un chat_id a la lista de registrados (si no estaba ya) y
+    lo persiste a disco. Devuelve True si era NUEVO (para poder avisarle
+    distinto la primera vez, si se quisiera)."""
+    chat_id = str(chat_id)
+    with LOCK:
+        es_nuevo = chat_id not in USUARIOS_REGISTRADOS
+        USUARIOS_REGISTRADOS.add(chat_id)
+        if es_nuevo:
+            _guardar_usuarios_disco()
+    return es_nuevo
+
+
 _cargar_estado_disco()
+_cargar_usuarios_disco()
+# Compatibilidad hacia atrás: si TELEGRAM_CHAT_ID sigue configurado (el
+# valor fijo de antes), se registra también como un usuario más -- así
+# quien ya lo tenía puesto no deja de recibir avisos de un día para otro
+# solo por este cambio, mientras las demás personas usan /start.
+if TELEGRAM_CHAT_ID:
+    _registrar_usuario(TELEGRAM_CHAT_ID)
 
 
 # ─────────────────────────────────────────────────────────────
 # Utilidades para hablar con la API de Telegram
 # ─────────────────────────────────────────────────────────────
-def _enviar_mensaje(texto: str, botones=None):
-    """Manda un mensaje al chat configurado. `botones` es una lista de
-    (texto_boton, callback_data) para armar un teclado inline -- se usa
-    para el "¿cuál lote?" cuando hay varios activos."""
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("[telegram] no configurado, no se puede enviar:", texto[:80], flush=True)
+def _enviar_mensaje(chat_id, texto: str, botones=None):
+    """Manda un mensaje a UN chat específico -- se usa para responder
+    preguntas (siempre al chat_id de quien preguntó, nunca a uno fijo).
+    `botones` es una lista de (texto_boton, callback_data) para armar un
+    teclado inline -- se usa para el "¿cuál lote?" cuando hay varios
+    activos."""
+    if not TELEGRAM_BOT_TOKEN or not chat_id:
+        print("[telegram] no configurado o sin chat_id, no se puede enviar:", texto[:80], flush=True)
         return
     payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
+        "chat_id": chat_id,
         "text": texto,
         "parse_mode": "HTML",
     }
@@ -116,7 +174,25 @@ def _enviar_mensaje(texto: str, botones=None):
     try:
         req_lib.post(f"{API_TELEGRAM}/sendMessage", json=payload, timeout=10)
     except Exception as e:
-        print(f"[telegram] error enviando mensaje: {e}", flush=True)
+        print(f"[telegram] error enviando mensaje a {chat_id}: {e}", flush=True)
+
+
+def _enviar_a_todos(texto: str):
+    """Manda un mensaje AUTOMÁTICO (ej. "lote terminado") a TODOS los
+    chat_id que se hayan registrado con /start -- reemplaza el
+    comportamiento anterior de mandar siempre a un único
+    TELEGRAM_CHAT_ID fijo. Si no hay nadie registrado todavía, no hace
+    nada (no hay a quién avisarle)."""
+    if not TELEGRAM_BOT_TOKEN:
+        print("[telegram] no configurado, no se puede enviar a nadie:", texto[:80], flush=True)
+        return
+    with LOCK:
+        destinatarios = list(USUARIOS_REGISTRADOS)
+    if not destinatarios:
+        print("[telegram] nadie registrado todavía (nadie ha escrito /start) -- aviso no enviado a nadie", flush=True)
+        return
+    for chat_id in destinatarios:
+        _enviar_mensaje(chat_id, texto)
 
 
 def _responder_callback(callback_query_id: str):
@@ -255,7 +331,7 @@ def recibir_aviso():
             info_borrada = LOTES.pop(clave_lote, None)
             _guardar_estado_disco()
         if info_borrada:
-            _enviar_mensaje(
+            _enviar_a_todos(
                 f"🗑 <b>Progreso borrado</b>\n\n"
                 f"<b>{_etiqueta_lote({**info_borrada, **datos})}</b>\n"
                 f"Fuente: {datos.get('fuente', info_borrada.get('fuente', '?'))}\n\n"
@@ -288,7 +364,7 @@ def recibir_aviso():
         else:
             encabezado = "✅ <b>Lote terminado</b>"
 
-        _enviar_mensaje(f"{encabezado}\n\n{_texto_estado(clave_lote)}")
+        _enviar_a_todos(f"{encabezado}\n\n{_texto_estado(clave_lote)}")
 
     return jsonify({"ok": True})
 
@@ -300,21 +376,42 @@ def recibir_aviso():
 def webhook_telegram():
     update = request.get_json(silent=True) or {}
 
-    # Clic en un botón ("¿cuál lote?")
+    # Clic en un botón ("¿cuál lote?") -- responde al chat de quien le
+    # dio clic, tomado del propio callback_query (no de un fijo).
     if "callback_query" in update:
         cq = update["callback_query"]
         clave_lote = cq.get("data", "")
+        chat_id = cq.get("message", {}).get("chat", {}).get("id")
         _responder_callback(cq["id"])
-        _enviar_mensaje(_texto_estado(clave_lote))
+        _enviar_mensaje(chat_id, _texto_estado(clave_lote))
         return jsonify({"ok": True})
 
-    # Mensaje de texto normal
+    # Mensaje de texto normal -- el chat_id de quien escribió viene en
+    # el propio mensaje (message.chat.id), NUNCA se usa un chat_id fijo
+    # para responder preguntas.
     mensaje = update.get("message", {})
+    chat_id = mensaje.get("chat", {}).get("id")
     texto = (mensaje.get("text") or "").strip().lower()
 
+    if not chat_id:
+        # Update sin chat identificable (raro, pero no debe tronar) --
+        # no hay a quién responder.
+        return jsonify({"ok": True})
+
     if texto in ("/start", "/help", "/ayuda"):
+        # /start registra a esta persona para que, de ahora en más,
+        # también reciba los avisos AUTOMÁTICOS (lote terminado) -- antes
+        # esos avisos solo le llegaban a un chat_id fijo puesto a mano.
+        es_nuevo = _registrar_usuario(chat_id)
+        saludo_registro = (
+            "✅ Quedaste registrado -- de ahora en más también te voy a avisar "
+            "automáticamente cuando un lote termine.\n\n"
+            if es_nuevo else ""
+        )
         _enviar_mensaje(
-            "👋 Hola, soy el bot de avisos del Extractor de Documentos Digitales.\n\n"
+            chat_id,
+            f"👋 Hola, soy el bot de avisos del Extractor de Documentos Digitales.\n\n"
+            f"{saludo_registro}"
             "<b>Lo que me puedes preguntar:</b>\n"
             "/estado — o simplemente escribe algo como \"¿cómo vas?\", \"avance\" "
             "o \"cómo va el proceso\" — te digo el estado ahora mismo.\n\n"
@@ -326,16 +423,16 @@ def webhook_telegram():
     if _es_pregunta_de_estado(texto):
         activos = _lotes_activos_recientes()
         if not activos:
-            _enviar_mensaje("No tengo ningún proceso activo o reciente registrado.")
+            _enviar_mensaje(chat_id, "No tengo ningún proceso activo o reciente registrado.")
         elif len(activos) == 1:
             (unica_clave,) = activos.keys()
-            _enviar_mensaje(_texto_estado(unica_clave))
+            _enviar_mensaje(chat_id, _texto_estado(unica_clave))
         else:
             botones = [(_etiqueta_lote(info), clave) for clave, info in activos.items()]
-            _enviar_mensaje("¿Cuál lote quieres consultar?", botones=botones)
+            _enviar_mensaje(chat_id, "¿Cuál lote quieres consultar?", botones=botones)
         return jsonify({"ok": True})
 
-    _enviar_mensaje("No entendí ese mensaje. Escribe /estado para ver el avance.")
+    _enviar_mensaje(chat_id, "No entendí ese mensaje. Escribe /estado para ver el avance.")
     return jsonify({"ok": True})
 
 

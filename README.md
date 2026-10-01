@@ -13,7 +13,7 @@ termina (desde Local, `.exe` o Railway), y responde tus preguntas por Telegram.
 | Variable | Valor |
 |---|---|
 | `TELEGRAM_BOT_TOKEN` | El token que te dio @BotFather |
-| `TELEGRAM_CHAT_ID` | Tu chat_id personal (el número que sacaste con `/getUpdates`) |
+| `TELEGRAM_CHAT_ID` | (opcional, solo para quien ya la tenía antes) Tu chat_id personal -- se registra automáticamente al arrancar, sin necesidad de volver a escribir `/start`. Las personas nuevas no necesitan esta variable: les basta con escribirle `/start` al bot desde su propio Telegram. |
 | `TELEGRAM_AVISO_TOKEN` | Una clave inventada por ti (ej. una contraseña larga cualquiera) — la vas a usar también en el Extractor |
 | `UMBRAL_ERRORES_ALERTA` | (opcional) porcentaje de error a partir del cual el aviso se marca como alerta. Por defecto 20 |
 
@@ -66,7 +66,21 @@ Si estas variables **no** se configuran en algún lugar, el Extractor sigue func
 exactamente igual que siempre — el aviso a Telegram queda desactivado en silencio, sin
 ningún efecto en el procesamiento.
 
-## 4. Usarlo
+## 4. Varias personas usando el mismo bot
+
+Cualquier persona (desde su propio Telegram, en su propio chat con el bot) le escribe
+`/start` **una sola vez** -- eso la registra. Desde ahí:
+
+- Si **pregunta** algo ("¿cómo vas?", "/estado"), la respuesta le llega **a ella**, no a
+  ninguna otra persona.
+- Cuando **cualquier** lote termina (sin importar en qué PC haya corrido), **todas** las
+  personas registradas reciben el aviso automático.
+
+No hace falta tocar el ZIP del Extractor para esto -- cada PC solo necesita sus propias
+variables (`TELEGRAM_BOT_URL`, `TELEGRAM_AVISO_TOKEN` iguales en todas; `FUENTE_EXTRACTOR`
+distinto en cada una, para identificarlas).
+
+## 5. Usarlo
 
 - Escríbele `/estado`, o simplemente algo natural como "¿cómo vas?", "avance", "cuánto
   llevas" o "cómo va el proceso" — el bot reconoce todas esas variantes.
