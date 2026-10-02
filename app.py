@@ -34,14 +34,17 @@ Variables de entorno necesarias (se configuran en Railway):
 Arranque: gunicorn --workers 1 --threads 4 --bind 0.0.0.0:$PORT app:app
 """
 import os
+import io
 import json
 import time
+import base64
 import threading
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 
 import requests as req_lib
 from flask import Flask, request, jsonify
+from PIL import Image, ImageDraw, ImageFont
 
 app = Flask(__name__)
 
@@ -52,6 +55,13 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 TELEGRAM_AVISO_TOKEN = os.environ.get("TELEGRAM_AVISO_TOKEN", "")
 UMBRAL_ERRORES_ALERTA = float(os.environ.get("UMBRAL_ERRORES_ALERTA", "20"))
+# Minutos sin recibir NINGÚN aviso de progreso de un lote "en proceso"
+# para considerarlo posiblemente atascado. El Extractor manda un aviso
+# de "progreso" cada 10 casos o cada 2 minutos (lo que pase primero,
+# ver _avisar_telegram en el Extractor) -- si pasa MUCHO más que eso sin
+# noticias, algo probablemente se congeló (red caída, Tesseract
+# colgado, etc.) en vez de seguir avanzando en silencio.
+UMBRAL_ATASCADO_MINUTOS = float(os.environ.get("UMBRAL_ATASCADO_MINUTOS", "20"))
 
 API_TELEGRAM = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 
@@ -99,8 +109,20 @@ LOTES = {}  # clave_lote -> dict con toda la info del último aviso recibido
 # terminado) se mandan a TODOS los chat_id registrados, no a uno fijo.
 USUARIOS_REGISTRADOS = set()  # conjunto de chat_id (como string)
 
+# HISTORIAL_TERMINADOS: a diferencia de LOTES (que SOBREESCRIBE el
+# último estado de cada clave_lote -- si el mismo lote corre 2 veces en
+# el día, la primera corrida se pierde), esto es un registro que
+# SOLO CRECE, uno por cada vez que un lote termina de verdad. Es lo que
+# permite un resumen diario real ("/resumen") que no dependa de qué
+# siga "vivo" en LOTES en este momento. Se recorta a los últimos 500
+# para no crecer sin límite -- de sobra para cualquier resumen diario
+# o semanal razonable.
+HISTORIAL_TERMINADOS = []  # [{fecha, hora, fuente, usuario, servidor, empresa, stats, clave_lote, detenido, error_general}, ...]
+MAX_HISTORIAL = 500
+
 ARCHIVO_ESTADO = Path(__file__).resolve().parent / "estado_lotes.json"
 ARCHIVO_USUARIOS = Path(__file__).resolve().parent / "usuarios_registrados.json"
+ARCHIVO_HISTORIAL = Path(__file__).resolve().parent / "historial_terminados.json"
 
 
 def _cargar_estado_disco():
@@ -141,6 +163,49 @@ def _guardar_usuarios_disco():
         print(f"[estado] no se pudo guardar usuarios_registrados.json: {e}", flush=True)
 
 
+def _cargar_historial_disco():
+    global HISTORIAL_TERMINADOS
+    if ARCHIVO_HISTORIAL.exists():
+        try:
+            with open(ARCHIVO_HISTORIAL, "r", encoding="utf-8") as f:
+                HISTORIAL_TERMINADOS.extend(json.load(f))
+            print(f"[arranque] {len(HISTORIAL_TERMINADOS)} entrada(s) de historial recuperadas", flush=True)
+        except Exception as e:
+            print(f"[arranque] no se pudo leer historial_terminados.json: {e}", flush=True)
+
+
+def _guardar_historial_disco():
+    try:
+        with open(ARCHIVO_HISTORIAL, "w", encoding="utf-8") as f:
+            json.dump(HISTORIAL_TERMINADOS[-MAX_HISTORIAL:], f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"[estado] no se pudo guardar historial_terminados.json: {e}", flush=True)
+
+
+def _registrar_en_historial(clave_lote, datos):
+    """Se llama cada vez que llega un aviso 'terminado' -- agrega una
+    entrada NUEVA al historial (nunca sobreescribe una anterior), para
+    que /resumen pueda contar correctamente aunque el mismo lote se
+    haya corrido más de una vez en el día."""
+    ahora = _ahora_colombia()
+    entrada = {
+        "clave_lote": clave_lote,
+        "fecha": ahora.strftime("%Y-%m-%d"),
+        "hora": ahora.strftime("%H:%M:%S"),
+        "fuente": datos.get("fuente", "?"),
+        "usuario": datos.get("usuario", "?"),
+        "servidor": datos.get("servidor", "?"),
+        "empresa": datos.get("empresa", "?"),
+        "stats": datos.get("stats", {}),
+        "detenido": bool(datos.get("detenido")),
+        "error_general": datos.get("error_general"),
+    }
+    with LOCK:
+        HISTORIAL_TERMINADOS.append(entrada)
+        del HISTORIAL_TERMINADOS[:-MAX_HISTORIAL]  # recorta por si acaso, aunque _guardar_historial_disco ya lo hace al guardar
+        _guardar_historial_disco()
+
+
 def _registrar_usuario(chat_id):
     """Agrega un chat_id a la lista de registrados (si no estaba ya) y
     lo persiste a disco. Devuelve True si era NUEVO (para poder avisarle
@@ -156,6 +221,7 @@ def _registrar_usuario(chat_id):
 
 _cargar_estado_disco()
 _cargar_usuarios_disco()
+_cargar_historial_disco()
 # Compatibilidad hacia atrás: si TELEGRAM_CHAT_ID sigue configurado (el
 # valor fijo de antes), se registra también como un usuario más -- así
 # quien ya lo tenía puesto no deja de recibir avisos de un día para otro
@@ -209,6 +275,54 @@ def _enviar_a_todos(texto: str):
         _enviar_mensaje(chat_id, texto)
 
 
+def _enviar_foto(chat_id, contenido_bytes: bytes, texto_pie: str = ""):
+    """Manda una imagen vía sendPhoto -- a diferencia de sendDocument,
+    esto hace que se vea como una foto normal en el chat (con vista
+    previa), no como un archivo adjunto para descargar aparte."""
+    if not TELEGRAM_BOT_TOKEN or not chat_id:
+        return
+    try:
+        req_lib.post(
+            f"{API_TELEGRAM}/sendPhoto",
+            data={"chat_id": chat_id, "caption": texto_pie, "parse_mode": "HTML"},
+            files={"photo": ("estado.png", contenido_bytes)},
+            timeout=20,
+        )
+    except Exception as e:
+        print(f"[telegram] error enviando foto a {chat_id}: {e}", flush=True)
+
+
+def _enviar_documento(chat_id, nombre_archivo: str, contenido_bytes: bytes, texto_pie: str = ""):
+    """Manda un archivo (ej. el Excel de errores) a UN chat, vía
+    sendDocument de Telegram -- a diferencia de sendMessage, este
+    endpoint necesita multipart/form-data (el archivo va como
+    'files', no como json)."""
+    if not TELEGRAM_BOT_TOKEN or not chat_id:
+        return
+    try:
+        req_lib.post(
+            f"{API_TELEGRAM}/sendDocument",
+            data={"chat_id": chat_id, "caption": texto_pie, "parse_mode": "HTML"},
+            files={"document": (nombre_archivo, contenido_bytes)},
+            timeout=20,
+        )
+    except Exception as e:
+        print(f"[telegram] error enviando documento a {chat_id}: {e}", flush=True)
+
+
+def _enviar_documento_a_todos(nombre_archivo: str, contenido_bytes: bytes, texto_pie: str = ""):
+    """Igual que _enviar_a_todos, pero mandando un ARCHIVO (ej. el Excel
+    de errores) en vez de solo texto -- a todos los chat_id registrados."""
+    if not TELEGRAM_BOT_TOKEN:
+        return
+    with LOCK:
+        destinatarios = list(USUARIOS_REGISTRADOS)
+    if not destinatarios:
+        return
+    for chat_id in destinatarios:
+        _enviar_documento(chat_id, nombre_archivo, contenido_bytes, texto_pie)
+
+
 def _responder_callback(callback_query_id: str):
     """Le dice a Telegram 'ya procesé el clic del botón' -- sin esto,
     el botón se queda con el relojito de 'cargando' en el celular."""
@@ -228,6 +342,9 @@ def _configurar_comandos():
         return
     comandos = [
         {"command": "estado", "description": "Ver cómo va el proceso ahora mismo"},
+        {"command": "imagen", "description": "Una imagen con la barra de progreso del lote"},
+        {"command": "resumen", "description": "Balance de todos los lotes terminados hoy"},
+        {"command": "quien", "description": "Qué PCs tienen un proceso activo ahora"},
         {"command": "eliminar", "description": "Borrar de la lista un lote ya terminado"},
         {"command": "help", "description": "Ver qué le puedes preguntar a este bot"},
     ]
@@ -248,6 +365,38 @@ _PALABRAS_CLAVE_ESTADO = (
     "listo", "termino", "terminó", "llevas", "cuanto va", "cuánto va",
 )
 
+# ─────────────────────────────────────────────────────────────
+# Router de intenciones -- reconoce preguntas NATURALES, no solo
+# comandos exactos tipo /estado. Cada intención tiene su propia lista
+# de palabras/frases -- si el mensaje contiene cualquiera de ellas
+# (o es el comando exacto), se dispara esa intención. Intencionalmente
+# simple (no es IA/NLP real, solo coincidencia de texto) -- pero cubre
+# bastante bien cómo la gente realmente pregunta en el día a día, sin
+# tener que acordarse de comandos exactos.
+# ─────────────────────────────────────────────────────────────
+_PALABRAS_CLAVE_RESUMEN = (
+    "resumen", "resumen del dia", "resumen del día", "como fue el dia",
+    "cómo fue el día", "como nos fue", "cómo nos fue", "balance del dia",
+    "balance del día", "total de hoy", "cuantos lotes", "cuántos lotes",
+)
+_PALABRAS_CLAVE_QUIEN = (
+    "/quien", "/quién", "/fuentes",
+    "quien esta", "quién está", "quien está", "quién esta",
+    "quien trabaja", "quién trabaja", "quienes estan", "quiénes están",
+    "que pc", "qué pc", "cuales pc", "cuáles pc", "fuentes activas",
+)
+_PALABRAS_CLAVE_ELIMINAR = ("/eliminar", "/borrar", "/limpiar", "borra el lote", "elimina el lote", "quita el lote")
+_PALABRAS_CLAVE_IMAGEN = (
+    "/imagen", "/foto", "manda una imagen", "mandame una imagen", "mándame una imagen",
+    "manda una foto", "mandame una foto", "mándame una foto", "como se ve", "cómo se ve",
+    "muestrame", "muéstrame", "mandame el avance en imagen", "una imagen de como va",
+)
+_PALABRAS_CLAVE_AYUDA = ("/start", "/help", "/ayuda", "ayuda", "que puedes hacer", "qué puedes hacer", "que me puedes decir")
+
+
+def _coincide_alguna(texto, lista):
+    return any(palabra in texto for palabra in lista)
+
 
 def _es_pregunta_de_estado(texto: str) -> bool:
     """True si el texto (ya en minúsculas) parece estar preguntando por
@@ -255,7 +404,156 @@ def _es_pregunta_de_estado(texto: str) -> bool:
     que contenga alguna de las palabras clave de arriba."""
     if texto in ("/estado",):
         return True
-    return any(palabra in texto for palabra in _PALABRAS_CLAVE_ESTADO)
+    return _coincide_alguna(texto, _PALABRAS_CLAVE_ESTADO)
+
+
+# ─────────────────────────────────────────────────────────────
+# Imagen tipo dashboard del estado de un lote (no es una captura de
+# pantalla del Extractor -- eso no es posible desde aquí, este bot no
+# tiene ningún acceso a la pantalla de la PC donde corre el Extractor.
+# Es un GRÁFICO generado con los mismos datos que ya se muestran en
+# texto: barra de progreso, OK/Error, tiempo estimado.
+# ─────────────────────────────────────────────────────────────
+_CARPETA_FUENTES = Path(__file__).resolve().parent / "fuentes"
+
+
+def _cargar_fuente(tamano, negrita=False):
+    """Usa las fuentes Liberation Sans empaquetadas DENTRO del proyecto
+    (no depende de qué fuentes tenga instaladas el contenedor de
+    Railway, que pueden ser distintas a las de un entorno de pruebas) --
+    y soportan tildes/ñ correctamente, a diferencia de la fuente interna
+    por defecto de Pillow."""
+    nombre = "LiberationSans-Bold.ttf" if negrita else "LiberationSans-Regular.ttf"
+    ruta = _CARPETA_FUENTES / nombre
+    try:
+        return ImageFont.truetype(str(ruta), tamano)
+    except Exception:
+        return ImageFont.load_default()  # respaldo, por si el archivo no está disponible por algún motivo
+
+
+def _generar_imagen_estado(clave_lote: str):
+    """Genera un PNG tipo tarjeta con el avance del lote -- devuelve los
+    bytes de la imagen, o None si no hay información de ese lote."""
+    info = LOTES.get(clave_lote)
+    if not info:
+        return None
+
+    stats = info.get("stats", {})
+    total = stats.get("total", 0)
+    ok = stats.get("ok", 0)
+    err = stats.get("err", 0)
+    procesados = ok + err
+    pct = (procesados / total * 100) if total else 0
+    evento = info.get("evento")
+
+    ancho, alto = 760, 320
+    color_fondo = (20, 24, 38)
+    color_tarjeta = (30, 35, 53)
+    color_texto = (235, 237, 245)
+    color_texto_tenue = (150, 155, 175)
+    color_barra_fondo = (50, 56, 78)
+    color_barra_ok = (46, 196, 109)
+    color_barra_err = (230, 80, 80)
+
+    img = Image.new("RGB", (ancho, alto), color_fondo)
+    draw = ImageDraw.Draw(img)
+    draw.rounded_rectangle([16, 16, ancho - 16, alto - 16], radius=18, fill=color_tarjeta)
+
+    f_titulo = _cargar_fuente(26, negrita=True)
+    f_normal = _cargar_fuente(20)
+    f_normal_negrita = _cargar_fuente(20, negrita=True)
+    f_chico = _cargar_fuente(16)
+
+    x = 44
+    y = 40
+    draw.text((x, y), _etiqueta_lote(info), font=f_titulo, fill=color_texto)
+    y += 38
+    draw.text((x, y), f"Fuente: {info.get('fuente', '?')}", font=f_chico, fill=color_texto_tenue)
+    y += 36
+
+    if evento == "terminado":
+        if info.get("detenido"):
+            estado_txt, color_estado = "Detenido por el usuario", (240, 180, 60)
+        elif info.get("error_general"):
+            estado_txt, color_estado = "Terminó con error", color_barra_err
+        else:
+            estado_txt, color_estado = "Terminado", color_barra_ok
+    else:
+        estado_txt, color_estado = "En proceso", (90, 160, 240)
+    draw.text((x, y), estado_txt, font=f_normal_negrita, fill=color_estado)
+    y += 34
+
+    barra_x0, barra_x1 = x, ancho - 44
+    barra_y0, barra_y1 = y, y + 34
+    draw.rounded_rectangle([barra_x0, barra_y0, barra_x1, barra_y1], radius=10, fill=color_barra_fondo)
+    ancho_barra = barra_x1 - barra_x0
+    if total:
+        ancho_ok = int(ancho_barra * (ok / total))
+        ancho_err = int(ancho_barra * (err / total))
+        if ancho_ok > 0:
+            draw.rounded_rectangle([barra_x0, barra_y0, barra_x0 + ancho_ok, barra_y1], radius=10, fill=color_barra_ok)
+        if ancho_err > 0:
+            draw.rectangle([barra_x0 + ancho_ok, barra_y0, barra_x0 + ancho_ok + ancho_err, barra_y1], fill=color_barra_err)
+    y = barra_y1 + 14
+
+    draw.text((x, y), f"{procesados} / {total}  ({pct:.0f}%)", font=f_normal, fill=color_texto)
+    y += 34
+    draw.text((x, y), f"OK: {ok}", font=f_normal_negrita, fill=color_barra_ok)
+    draw.text((x + 160, y), f"Error: {err}", font=f_normal_negrita, fill=color_barra_err)
+    y += 38
+
+    if evento != "terminado":
+        texto_eta = _texto_tiempo_estimado(info)
+        if texto_eta:
+            # El texto puede tener 2 líneas (separadas por " · ") -- se
+            # recorta a lo que quepa, sin tratar de meter todo en una
+            # sola línea diminuta.
+            draw.text((x, y), texto_eta.replace(" · ", "\n"), font=f_chico, fill=color_texto_tenue)
+
+    buffer = io.BytesIO()
+    img.save(buffer, format="PNG")
+    buffer.seek(0)
+    return buffer.read()
+
+
+def _texto_tiempo_estimado(info: dict) -> str:
+    """Calcula hace cuánto empezó el lote y, con la velocidad real
+    observada hasta ahora (procesados / tiempo transcurrido), estima
+    cuánto falta para terminar -- NUNCA inventa un número si no hay
+    suficiente información todavía (ej. recién empezó, o no se ha
+    procesado ni 1 caso), para no mostrar una estimación engañosa."""
+    inicio = info.get("_inicio_timestamp")
+    stats = info.get("stats", {})
+    total = stats.get("total", 0)
+    procesados = stats.get("ok", 0) + stats.get("err", 0)
+    if not inicio or not total or procesados < 1:
+        return ""  # sin datos suficientes todavía para estimar nada serio
+
+    transcurrido_seg = time.time() - inicio
+    if transcurrido_seg < 5:
+        return ""  # demasiado pronto -- cualquier estimación con <5s sería puro ruido
+
+    velocidad = procesados / transcurrido_seg  # casos por segundo
+    restantes = max(total - procesados, 0)
+    if restantes == 0 or velocidad <= 0:
+        return ""
+
+    eta_seg = restantes / velocidad
+
+    def _formatear(segundos):
+        segundos = int(segundos)
+        horas, resto = divmod(segundos, 3600)
+        minutos, _ = divmod(resto, 60)
+        if horas > 0:
+            return f"{horas}h {minutos}min"
+        if minutos > 0:
+            return f"{minutos} min"
+        return "menos de 1 min"
+
+    return (
+        f"Llevan {_formatear(transcurrido_seg)} corriendo · "
+        f"Estimado para terminar: ~{_formatear(eta_seg)} más"
+    )
 
 
 # ─────────────────────────────────────────────────────────────
@@ -300,6 +598,10 @@ def _texto_estado(clave_lote: str) -> str:
 
     lineas.append(f"Avance: {procesados} / {total} ({pct}%)")
     lineas.append(f"OK: {ok} · Error: {err}")
+    if info.get("evento") != "terminado":
+        texto_eta = _texto_tiempo_estimado(info)
+        if texto_eta:
+            lineas.append(texto_eta)
     ultima = info.get("_ultima_actualizacion")
     if ultima:
         lineas.append(f"\n<i>Última actualización: {ultima}</i>")
@@ -332,6 +634,119 @@ def _lotes_activos_recientes(horas=48):
         if ahora - ts <= horas * 3600:
             activos[clave] = info
     return activos
+
+
+def _revisar_lotes_atascados():
+    """Revisa TODOS los lotes que siguen 'en proceso' (no terminados) y
+    avisa si alguno lleva más de UMBRAL_ATASCADO_MINUTOS sin reportar
+    ningún avance -- señal de que probablemente se congeló.
+
+    IMPORTANTE sobre cuándo se llama esto: Railway puede DORMIR este
+    servicio cuando no hay tráfico (sleepApplication=true) -- un hilo de
+    fondo con un "cada N minutos" NO serviría, porque mientras el
+    contenedor esté dormido, ningún hilo corre. Por eso esto se llama de
+    forma OPORTUNISTA, dentro de /aviso -- cada vez que CUALQUIER
+    Extractor manda un aviso (lo cual ya pasa periódicamente mientras
+    algo esté corriendo), se aprovecha ese momento -- en el que el
+    servicio ya está despierto de todas formas -- para revisar el
+    estado de TODOS los lotes, no solo el que acaba de avisar.
+
+    Para no mandar la misma alerta una y otra vez por el mismo lote
+    atascado, se marca `_alertado_atascado` en el propio registro del
+    lote -- se limpia solo cuando ese lote vuelve a mandar progreso real
+    (ver recibir_aviso), así que si se destraba solo, puede volver a
+    alertar si se vuelve a atascar más adelante."""
+    ahora = time.time()
+    con_LOCK_ya_tomado = False
+    lotes_atascados = []
+    with LOCK:
+        for clave, info in LOTES.items():
+            if info.get("evento") == "terminado":
+                continue
+            ts = info.get("_timestamp", 0)
+            minutos_sin_noticias = (ahora - ts) / 60
+            if minutos_sin_noticias >= UMBRAL_ATASCADO_MINUTOS and not info.get("_alertado_atascado"):
+                info["_alertado_atascado"] = True
+                lotes_atascados.append((clave, info, minutos_sin_noticias))
+        if lotes_atascados:
+            _guardar_estado_disco()
+    for clave, info, minutos in lotes_atascados:
+        _enviar_a_todos(
+            f"⏱ <b>Posible lote atascado</b>\n\n"
+            f"<b>{_etiqueta_lote(info)}</b>\n"
+            f"Fuente: {info.get('fuente', '?')}\n\n"
+            f"Lleva {minutos:.0f} minutos sin reportar ningún avance nuevo "
+            f"-- si el Extractor sigue corriendo, puede valer la pena revisarlo."
+        )
+
+
+def _texto_quien_activo():
+    """Lista las "fuentes" (PCs) con algún lote activo (no terminado)
+    ahora mismo -- útil cuando trabajan varias personas y se quiere
+    saber quién tiene el Extractor corriendo algo en este momento."""
+    activos = _lotes_activos_recientes()
+    en_proceso = {clave: info for clave, info in activos.items() if info.get("evento") != "terminado"}
+    if not en_proceso:
+        return "No hay ninguna fuente con un proceso activo ahora mismo."
+    lineas = ["<b>🖥 Quién está trabajando ahora:</b>", ""]
+    for info in en_proceso.values():
+        stats = info.get("stats", {})
+        total, ok, err = stats.get("total", 0), stats.get("ok", 0), stats.get("err", 0)
+        procesados = ok + err
+        lineas.append(
+            f"• {info.get('fuente', '?')} — {_etiqueta_lote(info)} "
+            f"({procesados}/{total})"
+        )
+    return "\n".join(lineas)
+
+
+def _texto_resumen_dia(fecha_str=None):
+    """Arma el texto de /resumen -- usa HISTORIAL_TERMINADOS (no LOTES),
+    así cuenta bien aunque el mismo lote se haya corrido más de una vez
+    en el día. `fecha_str` en formato YYYY-MM-DD; por defecto, hoy
+    (hora de Colombia)."""
+    fecha_str = fecha_str or _ahora_colombia().strftime("%Y-%m-%d")
+    entradas_del_dia = [e for e in HISTORIAL_TERMINADOS if e.get("fecha") == fecha_str]
+
+    if not entradas_del_dia:
+        etiqueta_fecha = "hoy" if fecha_str == _ahora_colombia().strftime("%Y-%m-%d") else fecha_str
+        return f"No hay ningún lote terminado registrado para {etiqueta_fecha}."
+
+    total_casos = total_ok = total_err = 0
+    detenidos = 0
+    # Agrupado por servidor (ej. "Bahía: 3 lotes, 45 OK, 5 error") --
+    # así, si un servidor en particular tuvo un mal día, se nota de una
+    # vez sin tener que sumar a mano cada lote por separado.
+    por_servidor = {}
+    for e in entradas_del_dia:
+        stats = e.get("stats", {})
+        t, ok, err = stats.get("total", 0), stats.get("ok", 0), stats.get("err", 0)
+        total_casos += t; total_ok += ok; total_err += err
+        if e.get("detenido"):
+            detenidos += 1
+        servidor = e.get("servidor") or "?"
+        acumulado = por_servidor.setdefault(servidor, {"lotes": 0, "ok": 0, "err": 0})
+        acumulado["lotes"] += 1
+        acumulado["ok"] += ok
+        acumulado["err"] += err
+
+    pct_error_global = (total_err / total_casos * 100) if total_casos else 0
+    etiqueta_fecha = "Hoy" if fecha_str == _ahora_colombia().strftime("%Y-%m-%d") else fecha_str
+
+    lineas = [
+        f"<b>📊 Resumen — {etiqueta_fecha}</b>",
+        "",
+        f"Lotes terminados: {len(entradas_del_dia)}" + (f" ({detenidos} detenido(s) por el usuario)" if detenidos else ""),
+        f"Casos totales: {total_casos} · OK: {total_ok} · Error: {total_err} ({pct_error_global:.0f}% de error)",
+        "",
+        "<b>Por servidor:</b>",
+    ]
+    for servidor, acc in sorted(por_servidor.items(), key=lambda kv: -kv[1]["err"]):
+        pct = (acc["err"] / (acc["ok"] + acc["err"]) * 100) if (acc["ok"] + acc["err"]) else 0
+        marca = " ⚠️" if pct >= UMBRAL_ERRORES_ALERTA else ""
+        lineas.append(f"• {servidor}: {acc['lotes']} lote(s) — OK {acc['ok']} · Error {acc['err']}{marca}")
+
+    return "\n".join(lineas)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -371,15 +786,31 @@ def recibir_aviso():
 
     with LOCK:
         info = LOTES.get(clave_lote, {})
+        inicio_previo = info.get("_inicio_timestamp")  # se preserva entre avisos, ver abajo
         info.update(datos)
         info["_timestamp"] = time.time()
         info["_ultima_actualizacion"] = _ahora_colombia().strftime("%Y-%m-%d %H:%M:%S")
+        # "_inicio_timestamp": el momento real en que este lote empezó
+        # (el PRIMER aviso que se recibió de él) -- NECESARIO para
+        # calcular el tiempo estimado de finalización (velocidad =
+        # procesados / tiempo transcurrido desde el inicio). Se guarda
+        # UNA SOLA VEZ: si ya existía de un aviso anterior, se conserva
+        # (info.update(datos) no lo toca porque el Extractor nunca manda
+        # un campo con ese nombre); si no existía (este es el primer
+        # aviso que se ve de este lote), se fija a ahora mismo.
+        info["_inicio_timestamp"] = inicio_previo or time.time()
+        # Si este lote había sido marcado como "posiblemente atascado" y
+        # ahora vuelve a mandar noticias (de lo que sea: progreso o
+        # terminado), se limpia esa marca -- si se vuelve a atascar más
+        # adelante, puede volver a alertar.
+        info.pop("_alertado_atascado", None)
         LOTES[clave_lote] = info
         _guardar_estado_disco()
 
     # Aviso AUTOMÁTICO cuando el lote termina -- sin que el usuario
     # tenga que preguntar nada.
     if datos.get("evento") == "terminado":
+        _registrar_en_historial(clave_lote, datos)
         stats = datos.get("stats", {})
         total = stats.get("total", 0)
         err = stats.get("err", 0)
@@ -395,6 +826,26 @@ def recibir_aviso():
             encabezado = "✅ <b>Lote terminado</b>"
 
         _enviar_a_todos(f"{encabezado}\n\n{_texto_estado(clave_lote)}")
+
+        # Si el Extractor adjuntó el Excel de errores (solo lo hace
+        # cuando hubo al menos 1 error -- ver _avisar_telegram en el
+        # Extractor), se reenvía como ARCHIVO real a todos los
+        # registrados, no solo mencionado en el texto. Viene en base64
+        # porque todo el aviso se manda como JSON normal (no
+        # multipart) -- se decodifica aquí antes de reenviarlo.
+        excel_b64 = datos.get("excel_errores_b64")
+        if excel_b64:
+            try:
+                contenido = base64.b64decode(excel_b64)
+                nombre = datos.get("excel_errores_nombre") or f"errores_{clave_lote}.xlsx"
+                _enviar_documento_a_todos(nombre, contenido, f"📎 Excel de errores — {_etiqueta_lote(info)}")
+            except Exception as e:
+                print(f"[telegram] no se pudo decodificar/enviar el Excel de errores: {e}", flush=True)
+
+    # Oportunista: ya que el servicio está despierto atendiendo este
+    # aviso, se aprovecha para revisar TODOS los lotes (no solo este) en
+    # busca de alguno que lleve mucho tiempo sin reportar nada.
+    _revisar_lotes_atascados()
 
     return jsonify({"ok": True})
 
@@ -414,14 +865,19 @@ def webhook_telegram():
         chat_id = cq.get("message", {}).get("chat", {}).get("id")
         _responder_callback(cq["id"])
 
-        # El prefijo decide la acción: "ver:<clave>" (botones de /estado,
-        # ya existía) o "borrar:<clave>" (botones nuevos de /eliminar).
+        # El prefijo decide la acción:
+        #   "ver:<clave>"            -> botones de /estado (ya existía)
+        #   "borrar:<clave>"         -> PRIMER clic en /eliminar -- ahora
+        #                               NO borra de una vez, pide confirmar
+        #   "confirmar-borrar:<clave>" -> SEGUNDO clic, confirmando -- recién
+        #                               aquí se borra de verdad
+        #   "cancelar-borrar"        -> el usuario se arrepintió, no se borra nada
         # Cualquier dato viejo sin prefijo (de un despliegue anterior a
         # este cambio) se trata como "ver", para no romper botones que
         # ya estuvieran mostrados en chats antiguos al momento de
         # actualizar el bot.
-        if data.startswith("borrar:"):
-            clave_lote = data[len("borrar:"):]
+        if data.startswith("confirmar-borrar:"):
+            clave_lote = data[len("confirmar-borrar:"):]
             with LOCK:
                 info_borrada = LOTES.pop(clave_lote, None)
                 if info_borrada:
@@ -433,6 +889,28 @@ def webhook_telegram():
                 )
             else:
                 _enviar_mensaje(chat_id, "Ese lote ya no estaba en la lista (puede que alguien más ya lo haya eliminado).")
+        elif data == "cancelar-borrar":
+            _enviar_mensaje(chat_id, "De acuerdo, no se eliminó nada.")
+        elif data.startswith("borrar:"):
+            # PRIMER clic -- no se borra todavía, se pide confirmar. Esto
+            # evita borrar algo sin querer con un solo clic apresurado.
+            clave_lote = data[len("borrar:"):]
+            info = LOTES.get(clave_lote)
+            if not info:
+                _enviar_mensaje(chat_id, "Ese lote ya no está en la lista.")
+            else:
+                _enviar_mensaje(
+                    chat_id,
+                    f"¿Seguro que quieres eliminar este lote de la lista?\n\n<b>{_etiqueta_lote(info)}</b>",
+                    botones=[("✅ Sí, eliminar", f"confirmar-borrar:{clave_lote}"), ("❌ No, cancelar", "cancelar-borrar")],
+                )
+        elif data.startswith("img:"):
+            clave_lote = data[len("img:"):]
+            imagen = _generar_imagen_estado(clave_lote)
+            if imagen:
+                _enviar_foto(chat_id, imagen)
+            else:
+                _enviar_mensaje(chat_id, "No se pudo generar la imagen de ese lote.")
         else:
             clave_lote = data[len("ver:"):] if data.startswith("ver:") else data
             _enviar_mensaje(chat_id, _texto_estado(clave_lote))
@@ -450,7 +928,7 @@ def webhook_telegram():
         # no hay a quién responder.
         return jsonify({"ok": True})
 
-    if texto in ("/start", "/help", "/ayuda"):
+    if texto in _PALABRAS_CLAVE_AYUDA or _coincide_alguna(texto, _PALABRAS_CLAVE_AYUDA):
         # /start registra a esta persona para que, de ahora en más,
         # también reciba los avisos AUTOMÁTICOS (lote terminado) -- antes
         # esos avisos solo le llegaban a un chat_id fijo puesto a mano.
@@ -464,13 +942,59 @@ def webhook_telegram():
             chat_id,
             f"👋 Hola, soy el bot de avisos del Extractor de Documentos Digitales.\n\n"
             f"{saludo_registro}"
-            "<b>Lo que me puedes preguntar:</b>\n"
-            "/estado — o simplemente escribe algo como \"¿cómo vas?\", \"avance\" "
-            "o \"cómo va el proceso\" — te digo el estado ahora mismo.\n"
-            "/eliminar — borra de la lista un lote que YA terminó (no uno que sigue en proceso).\n\n"
+            "<b>Lo que me puedes preguntar</b> (no hace falta el comando exacto, "
+            "también entiendo frases naturales):\n"
+            "• \"¿cómo vas?\", \"avance\" — el estado ahora mismo (/estado).\n"
+            "• \"resumen del día\", \"cómo nos fue hoy\" — el balance de todos los "
+            "lotes terminados hoy (/resumen).\n"
+            "• \"¿quién está trabajando?\" — qué PCs tienen algo activo (/quien).\n"
+            "• \"mándame una imagen\" — una tarjeta con la barra de progreso "
+            "del lote (/imagen; no es una captura de pantalla del Extractor, "
+            "es un gráfico generado con los mismos datos).\n"
+            "• \"elimina el lote\" — borra de la lista un lote ya terminado, "
+            "pidiendo confirmación antes (/eliminar).\n\n"
             "También te aviso <b>sin que preguntes nada</b> cuando un lote termina "
-            "(y te marco una alerta si tuvo muchos errores)."
+            "(y te marco una alerta si tuvo muchos errores), o si un lote lleva "
+            "mucho tiempo sin reportar avance."
         )
+        return jsonify({"ok": True})
+
+    if _coincide_alguna(texto, _PALABRAS_CLAVE_RESUMEN):
+        _enviar_mensaje(chat_id, _texto_resumen_dia())
+        return jsonify({"ok": True})
+
+    if _coincide_alguna(texto, _PALABRAS_CLAVE_QUIEN):
+        _enviar_mensaje(chat_id, _texto_quien_activo())
+        return jsonify({"ok": True})
+
+    if _coincide_alguna(texto, _PALABRAS_CLAVE_IMAGEN):
+        activos = _lotes_activos_recientes()
+        if not activos:
+            _enviar_mensaje(chat_id, "No tengo ningún proceso activo o reciente para mostrar en imagen.")
+        elif len(activos) == 1:
+            (unica_clave,) = activos.keys()
+            imagen = _generar_imagen_estado(unica_clave)
+            if imagen:
+                _enviar_foto(chat_id, imagen)
+            else:
+                _enviar_mensaje(chat_id, "No se pudo generar la imagen de ese lote.")
+        else:
+            botones = [(_etiqueta_lote(info), f"img:{clave}") for clave, info in activos.items()]
+            _enviar_mensaje(chat_id, "¿De cuál lote quieres la imagen?", botones=botones)
+        return jsonify({"ok": True})
+
+    if _coincide_alguna(texto, _PALABRAS_CLAVE_ELIMINAR):
+        # A propósito, solo ofrece lotes YA TERMINADOS -- uno que sigue
+        # "en proceso" no se deja eliminar desde aquí, ni aunque parezca
+        # atascado; si de verdad se quedó colgado, lo correcto es
+        # revisarlo en el Extractor (ahí vive el progreso real), no
+        # simplemente esconderlo de la lista del bot.
+        terminados = _lotes_terminados_recientes()
+        if not terminados:
+            _enviar_mensaje(chat_id, "No tengo ningún lote terminado para eliminar ahora mismo.")
+        else:
+            botones = [(_etiqueta_lote(info), f"borrar:{clave}") for clave, info in terminados.items()]
+            _enviar_mensaje(chat_id, "¿Cuál lote terminado quieres eliminar de la lista?", botones=botones)
         return jsonify({"ok": True})
 
     if _es_pregunta_de_estado(texto):
@@ -485,21 +1009,7 @@ def webhook_telegram():
             _enviar_mensaje(chat_id, "¿Cuál lote quieres consultar?", botones=botones)
         return jsonify({"ok": True})
 
-    if texto in ("/eliminar", "/borrar", "/limpiar"):
-        # A propósito, solo ofrece lotes YA TERMINADOS -- uno que sigue
-        # "en proceso" no se deja eliminar desde aquí, ni aunque parezca
-        # atascado; si de verdad se quedó colgado, lo correcto es
-        # revisarlo en el Extractor (ahí vive el progreso real), no
-        # simplemente esconderlo de la lista del bot.
-        terminados = _lotes_terminados_recientes()
-        if not terminados:
-            _enviar_mensaje(chat_id, "No tengo ningún lote terminado para eliminar ahora mismo.")
-        else:
-            botones = [(_etiqueta_lote(info), f"borrar:{clave}") for clave, info in terminados.items()]
-            _enviar_mensaje(chat_id, "¿Cuál lote terminado quieres eliminar de la lista?", botones=botones)
-        return jsonify({"ok": True})
-
-    _enviar_mensaje(chat_id, "No entendí ese mensaje. Escribe /estado para ver el avance.")
+    _enviar_mensaje(chat_id, "No entendí ese mensaje. Escribe /ayuda para ver qué me puedes preguntar.")
     return jsonify({"ok": True})
 
 

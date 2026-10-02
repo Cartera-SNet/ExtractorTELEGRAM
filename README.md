@@ -93,7 +93,21 @@ distinto en cada una, para identificarlas).
 - `/help` (o `/start`) te recuerda en cualquier momento qué le puedes preguntar.
 - `/eliminar` te deja borrar de la lista un lote que **ya terminó** (con botones para
   elegir cuál) — un lote que sigue "en proceso" no se puede eliminar desde aquí, a
-  propósito: si de verdad se quedó atascado, hay que revisarlo en el Extractor.
+  propósito: si de verdad se quedó atascado, hay que revisarlo en el Extractor. Pide
+  confirmación (sí/no) antes de borrar de verdad.
+- `/resumen` (o "cómo nos fue hoy") — balance de todos los lotes terminados en el día,
+  agrupado por servidor, marcando con ⚠️ el que tuvo mucho error.
+- `/quien` (o "¿quién está trabajando?") — lista las fuentes (PCs) con un proceso activo
+  ahora mismo.
+- `/imagen` (o "mándame una imagen") — una tarjeta tipo dashboard con la barra de
+  progreso, OK/Error y tiempo estimado, generada con los mismos datos de `/estado` —
+  **no** es una captura de pantalla del Extractor (eso no es posible desde aquí), es un
+  gráfico.
+- Si un lote lleva más de `UMBRAL_ATASCADO_MINUTOS` (por defecto 20) sin reportar
+  ningún avance nuevo, el bot avisa que posiblemente se atascó — sin spamear, solo una
+  vez por atasco (si se destraba y se vuelve a atascar después, puede avisar de nuevo).
+- Cuando un lote termina con al menos 1 error, el Extractor adjunta el Excel de errores
+  y el bot lo reenvía como archivo real de Telegram, no solo mencionado en el texto.
 
 ## Notas de seguridad
 
