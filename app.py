@@ -258,19 +258,19 @@ def _enviar_mensaje(chat_id, texto: str, botones=None):
 
 
 def _enviar_a_todos(texto: str):
-    """Manda un mensaje AUTOMÁTICO (ej. "lote terminado") a TODOS los
-    chat_id que se hayan registrado con /start -- reemplaza el
-    comportamiento anterior de mandar siempre a un único
-    TELEGRAM_CHAT_ID fijo. Si no hay nadie registrado todavía, no hace
-    nada (no hay a quién avisarle)."""
+    """Manda un mensaje AUTOMÁTICO a TODOS los chat_id registrados
+    (cualquier persona que haya escrito al bot al menos una vez:
+    /start, /estado, etc.). Si no hay nadie registrado, no hace nada."""
     if not TELEGRAM_BOT_TOKEN:
         print("[telegram] no configurado, no se puede enviar a nadie:", texto[:80], flush=True)
         return
     with LOCK:
         destinatarios = list(USUARIOS_REGISTRADOS)
     if not destinatarios:
-        print("[telegram] nadie registrado todavía (nadie ha escrito /start) -- aviso no enviado a nadie", flush=True)
+        print("[telegram] nadie registrado todavía -- aviso no enviado a nadie. "
+              "Que cada persona escriba /start o cualquier mensaje al bot.", flush=True)
         return
+    print(f"[telegram] enviando aviso automático a {len(destinatarios)} usuario(s)", flush=True)
     for chat_id in destinatarios:
         _enviar_mensaje(chat_id, texto)
 
@@ -807,6 +807,19 @@ def recibir_aviso():
         LOTES[clave_lote] = info
         _guardar_estado_disco()
 
+    # Aviso AUTOMÁTICO al INICIAR -- todos los registrados se enteran
+    # sin tener que preguntar /estado.
+    if datos.get("evento") == "iniciado":
+        stats = datos.get("stats", {}) or {}
+        total = stats.get("total", datos.get("total_casos", "?"))
+        _enviar_a_todos(
+            f"▶️ <b>Lote iniciado</b>\n\n"
+            f"<b>{_etiqueta_lote(info)}</b>\n"
+            f"Fuente: {datos.get('fuente', info.get('fuente', '?'))}\n"
+            f"Casos: {total}\n\n"
+            f"Te aviso cuando termine (o si se atasca). También puedes escribir /estado."
+        )
+
     # Aviso AUTOMÁTICO cuando el lote termina -- sin que el usuario
     # tenga que preguntar nada.
     if datos.get("evento") == "terminado":
@@ -863,6 +876,8 @@ def webhook_telegram():
         cq = update["callback_query"]
         data = cq.get("data", "")
         chat_id = cq.get("message", {}).get("chat", {}).get("id")
+        if chat_id:
+            _registrar_usuario(chat_id)
         _responder_callback(cq["id"])
 
         # El prefijo decide la acción:
@@ -928,15 +943,17 @@ def webhook_telegram():
         # no hay a quién responder.
         return jsonify({"ok": True})
 
+    # CUALQUIER mensaje registra al usuario para avisos automáticos
+    # (antes solo /start lo hacía: quien solo usaba /estado nunca recibía
+    # "lote terminado" push).
+    es_nuevo = _registrar_usuario(chat_id)
+
     if texto in _PALABRAS_CLAVE_AYUDA or _coincide_alguna(texto, _PALABRAS_CLAVE_AYUDA):
-        # /start registra a esta persona para que, de ahora en más,
-        # también reciba los avisos AUTOMÁTICOS (lote terminado) -- antes
-        # esos avisos solo le llegaban a un chat_id fijo puesto a mano.
-        es_nuevo = _registrar_usuario(chat_id)
         saludo_registro = (
-            "✅ Quedaste registrado -- de ahora en más también te voy a avisar "
-            "automáticamente cuando un lote termine.\n\n"
-            if es_nuevo else ""
+            "✅ Quedaste registrado -- de ahora en más te aviso automáticamente "
+            "cuando un lote inicie o termine (igual que a los demás).\n\n"
+            if es_nuevo else
+            "✅ Ya estabas registrado -- sigues recibiendo los avisos automáticos.\n\n"
         )
         _enviar_mensaje(
             chat_id,
@@ -953,9 +970,9 @@ def webhook_telegram():
             "es un gráfico generado con los mismos datos).\n"
             "• \"elimina el lote\" — borra de la lista un lote ya terminado, "
             "pidiendo confirmación antes (/eliminar).\n\n"
-            "También te aviso <b>sin que preguntes nada</b> cuando un lote termina "
-            "(y te marco una alerta si tuvo muchos errores), o si un lote lleva "
-            "mucho tiempo sin reportar avance."
+            "También te aviso <b>sin que preguntes nada</b> (a todos los registrados) "
+            "cuando un lote <b>inicia</b> o <b>termina</b> (con alerta si hubo muchos errores), "
+            "si se borró el progreso, o si un lote lleva mucho tiempo sin reportar avance."
         )
         return jsonify({"ok": True})
 

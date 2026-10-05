@@ -3,6 +3,20 @@
 Servicio pequeño y separado del Extractor. Recibe avisos cuando un lote arranca o
 termina (desde Local, `.exe` o Railway), y responde tus preguntas por Telegram.
 
+
+## Avisos automáticos a todos los usuarios
+
+Cualquier persona que escriba al bot (**/start**, **/estado**, o cualquier mensaje) queda **registrada**.
+
+A **todos** los registrados les llegan, sin preguntar:
+
+- ▶️ Lote iniciado  
+- ✅ / ⚠️ / ⏸ Lote terminado (o detenido / con error)  
+- 🗑 Progreso borrado  
+- ⏱ Posible lote atascado  
+
+`/estado` sigue disponible para consultar en cualquier momento.
+
 ## 1. Desplegar en Railway
 
 1. Crea un **nuevo proyecto** en Railway (aparte del Extractor — son 2 servicios
