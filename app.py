@@ -276,20 +276,28 @@ def _enviar_a_todos(texto: str):
 
 
 def _enviar_foto(chat_id, contenido_bytes: bytes, texto_pie: str = ""):
-    """Manda una imagen vía sendPhoto -- a diferencia de sendDocument,
-    esto hace que se vea como una foto normal en el chat (con vista
-    previa), no como un archivo adjunto para descargar aparte."""
+    """Manda la tarjeta de estado. Si es GIF animado usa sendAnimation
+    (el robotsito se mueve); si es PNG, sendPhoto."""
     if not TELEGRAM_BOT_TOKEN or not chat_id:
         return
+    es_gif = contenido_bytes[:6] in (b"GIF87a", b"GIF89a")
     try:
-        req_lib.post(
-            f"{API_TELEGRAM}/sendPhoto",
-            data={"chat_id": chat_id, "caption": texto_pie, "parse_mode": "HTML"},
-            files={"photo": ("estado.png", contenido_bytes)},
-            timeout=20,
-        )
+        if es_gif:
+            req_lib.post(
+                f"{API_TELEGRAM}/sendAnimation",
+                data={"chat_id": chat_id, "caption": texto_pie, "parse_mode": "HTML"},
+                files={"animation": ("estado.gif", contenido_bytes, "image/gif")},
+                timeout=30,
+            )
+        else:
+            req_lib.post(
+                f"{API_TELEGRAM}/sendPhoto",
+                data={"chat_id": chat_id, "caption": texto_pie, "parse_mode": "HTML"},
+                files={"photo": ("estado.png", contenido_bytes)},
+                timeout=20,
+            )
     except Exception as e:
-        print(f"[telegram] error enviando foto a {chat_id}: {e}", flush=True)
+        print(f"[telegram] error enviando foto/animación a {chat_id}: {e}", flush=True)
 
 
 def _enviar_documento(chat_id, nombre_archivo: str, contenido_bytes: bytes, texto_pie: str = ""):
@@ -431,12 +439,96 @@ def _cargar_fuente(tamano, negrita=False):
         return ImageFont.load_default()  # respaldo, por si el archivo no está disponible por algún motivo
 
 
+def _dibujar_robot(draw, ox, oy, escala=1.0, modo="loading", fase=0.0):
+    """Dibuja el robotsito del Extractor (formas simples, mismos colores).
+    modo: idle | loading | done | error → color de ojos/antena.
+    fase: 0..1 para animación (flotación y brillo de ojos)."""
+    import math
+    # Flotación vertical suave
+    oy = oy + int(3 * math.sin(fase * 2 * math.pi))
+    colores = {
+        "idle":    ((99, 102, 241), (29, 78, 216)),
+        "loading": ((16, 185, 129), (5, 150, 105)),
+        "done":    ((16, 185, 129), (5, 150, 105)),
+        "error":   ((239, 68, 68), (220, 38, 38)),
+    }
+    ojo, pupila = colores.get(modo, colores["loading"])
+    # En loading: ojitos fijos en verde (solo flota el cuerpo)
+    if modo == "loading":
+        ojo = (16, 185, 129)
+        pupila = (5, 150, 105)
+    cuerpo = (55, 48, 163)      # #3730a3
+    cuerpo_borde = (67, 56, 202)
+    oscuro = (30, 27, 75)       # #1e1b4b
+    oreja = (49, 46, 129)
+
+    def s(v):
+        return int(v * escala)
+
+    def rr(x, y, w, h, rad, fill, outline=None):
+        draw.rounded_rectangle(
+            [ox + s(x), oy + s(y), ox + s(x + w), oy + s(y + h)],
+            radius=max(1, s(rad)), fill=fill, outline=outline,
+        )
+
+    def cir(cx, cy, r, fill):
+        draw.ellipse(
+            [ox + s(cx - r), oy + s(cy - r), ox + s(cx + r), oy + s(cy + r)],
+            fill=fill,
+        )
+
+    # Antena
+    draw.line([ox + s(60), oy + s(22), ox + s(60), oy + s(11)], fill=ojo, width=max(2, s(3)))
+    cir(60, 7, 5, ojo)
+    # Cabeza
+    rr(29, 22, 62, 44, 11, cuerpo, cuerpo_borde)
+    rr(20, 30, 10, 20, 5, oreja, cuerpo_borde)
+    rr(90, 30, 10, 20, 5, oreja, cuerpo_borde)
+    # Visor + ojos
+    rr(37, 31, 46, 22, 7, oscuro)
+    cir(49, 42, 5.5, ojo)
+    cir(71, 42, 5.5, ojo)
+    cir(49, 42, 2.8, pupila)
+    cir(71, 42, 2.8, pupila)
+    cir(51, 40, 1.2, (255, 255, 255))
+    cir(73, 40, 1.2, (255, 255, 255))
+    # Boca / rejilla
+    rr(44, 55, 32, 7, 3, oscuro)
+    # Cuello
+    rr(50, 66, 20, 12, 5, oreja)
+    # Cuerpo
+    rr(17, 78, 86, 56, 11, cuerpo, cuerpo_borde)
+    rr(27, 86, 66, 40, 7, oscuro)
+    # Luces del pecho
+    for lx in (42, 60, 78):
+        cir(lx, 106, 3.5, ojo)
+    # Brazos
+    rr(5, 90, 12, 28, 5, oreja)
+    rr(103, 90, 12, 28, 5, oreja)
+    # Piernas
+    rr(35, 134, 18, 17, 5, oreja)
+    rr(67, 134, 18, 17, 5, oreja)
+    rr(32, 147, 23, 9, 4, cuerpo_borde)
+    rr(65, 147, 23, 9, 4, cuerpo_borde)
+
+
+def _formatear_duracion(segundos):
+    segundos = max(0, int(segundos))
+    h, resto = divmod(segundos, 3600)
+    m, s = divmod(resto, 60)
+    if h > 0:
+        return f"{h:02d}:{m:02d}:{s:02d}"
+    return f"{m:02d}:{s:02d}"
+
+
 def _generar_imagen_estado(clave_lote: str):
-    """Genera un PNG tipo tarjeta con el avance del lote -- devuelve los
-    bytes de la imagen, o None si no hay información de ese lote."""
+    """Genera tarjeta estilo Extractor. En proceso: GIF con robotsito animado.
+    Terminado: PNG estático."""
     info = LOTES.get(clave_lote)
     if not info:
         return None
+
+    import math
 
     stats = info.get("stats", {})
     total = stats.get("total", 0)
@@ -446,74 +538,141 @@ def _generar_imagen_estado(clave_lote: str):
     pct = (procesados / total * 100) if total else 0
     evento = info.get("evento")
 
-    ancho, alto = 760, 320
-    color_fondo = (20, 24, 38)
-    color_tarjeta = (30, 35, 53)
-    color_texto = (235, 237, 245)
-    color_texto_tenue = (150, 155, 175)
-    color_barra_fondo = (50, 56, 78)
-    color_barra_ok = (46, 196, 109)
-    color_barra_err = (230, 80, 80)
+    inicio = info.get("_inicio_timestamp")
+    ahora = time.time()
+    transcurrido = (ahora - inicio) if inicio else 0
 
-    img = Image.new("RGB", (ancho, alto), color_fondo)
-    draw = ImageDraw.Draw(img)
-    draw.rounded_rectangle([16, 16, ancho - 16, alto - 16], radius=18, fill=color_tarjeta)
-
-    f_titulo = _cargar_fuente(26, negrita=True)
-    f_normal = _cargar_fuente(20)
-    f_normal_negrita = _cargar_fuente(20, negrita=True)
-    f_chico = _cargar_fuente(16)
-
-    x = 44
-    y = 40
-    draw.text((x, y), _etiqueta_lote(info), font=f_titulo, fill=color_texto)
-    y += 38
-    draw.text((x, y), f"Fuente: {info.get('fuente', '?')}", font=f_chico, fill=color_texto_tenue)
-    y += 36
+    restante_txt = "—"
+    if inicio and total and procesados >= 1 and transcurrido >= 5:
+        velocidad = procesados / transcurrido
+        restantes = max(total - procesados, 0)
+        if velocidad > 0 and restantes > 0:
+            restante_txt = "~" + _formatear_duracion(restantes / velocidad)
+        elif restantes == 0:
+            restante_txt = "0:00"
 
     if evento == "terminado":
         if info.get("detenido"):
-            estado_txt, color_estado = "Detenido por el usuario", (240, 180, 60)
+            estado_txt, color_estado, modo_robot = "Detenido por el usuario", (217, 119, 6), "error"
         elif info.get("error_general"):
-            estado_txt, color_estado = "Terminó con error", color_barra_err
+            estado_txt, color_estado, modo_robot = "Terminó con error", (220, 38, 38), "error"
         else:
-            estado_txt, color_estado = "Terminado", color_barra_ok
+            estado_txt, color_estado, modo_robot = "Proceso finalizado", (16, 185, 129), "done"
     else:
-        estado_txt, color_estado = "En proceso", (90, 160, 240)
-    draw.text((x, y), estado_txt, font=f_normal_negrita, fill=color_estado)
-    y += 34
+        estado_txt, color_estado, modo_robot = "Buscando documentos…", (99, 102, 241), "loading"
 
-    barra_x0, barra_x1 = x, ancho - 44
-    barra_y0, barra_y1 = y, y + 34
-    draw.rounded_rectangle([barra_x0, barra_y0, barra_x1, barra_y1], radius=10, fill=color_barra_fondo)
-    ancho_barra = barra_x1 - barra_x0
-    if total:
-        ancho_ok = int(ancho_barra * (ok / total))
-        ancho_err = int(ancho_barra * (err / total))
-        if ancho_ok > 0:
-            draw.rounded_rectangle([barra_x0, barra_y0, barra_x0 + ancho_ok, barra_y1], radius=10, fill=color_barra_ok)
-        if ancho_err > 0:
-            draw.rectangle([barra_x0 + ancho_ok, barra_y0, barra_x0 + ancho_ok + ancho_err, barra_y1], fill=color_barra_err)
-    y = barra_y1 + 14
+    ancho, alto = 860, 420
+    c_fondo = (245, 243, 255)
+    c_tarjeta = (255, 255, 255)
+    c_borde = (226, 232, 240)
+    c_texto = (30, 41, 59)
+    c_tenue = (100, 116, 139)
+    c_accent = (99, 102, 241)
+    c_ok, c_ok_bg = (22, 163, 74), (220, 252, 231)
+    c_err, c_err_bg = (220, 38, 38), (254, 226, 226)
+    c_total_bg = (241, 245, 249)
+    c_barra_bg, c_barra = (226, 232, 240), (99, 102, 241)
 
-    draw.text((x, y), f"{procesados} / {total}  ({pct:.0f}%)", font=f_normal, fill=color_texto)
-    y += 34
-    draw.text((x, y), f"OK: {ok}", font=f_normal_negrita, fill=color_barra_ok)
-    draw.text((x + 160, y), f"Error: {err}", font=f_normal_negrita, fill=color_barra_err)
-    y += 38
+    f_titulo = _cargar_fuente(22, negrita=True)
+    f_negrita = _cargar_fuente(17, negrita=True)
+    f_normal = _cargar_fuente(16)
+    f_chico = _cargar_fuente(13)
+    f_stat = _cargar_fuente(26, negrita=True)
+    f_timer = _cargar_fuente(20, negrita=True)
 
-    if evento != "terminado":
-        texto_eta = _texto_tiempo_estimado(info)
-        if texto_eta:
-            # El texto puede tener 2 líneas (separadas por " · ") -- se
-            # recorta a lo que quepa, sin tratar de meter todo en una
-            # sola línea diminuta.
-            draw.text((x, y), texto_eta.replace(" · ", "\n"), font=f_chico, fill=color_texto_tenue)
+    etiqueta = _etiqueta_lote(info)
+    fuente = info.get("fuente") or "?"
+    empresa = info.get("empresa") or ""
+    sub = f"Fuente: {fuente}"
+    if empresa:
+        sub += f"  ·  {empresa}"
+
+    robot_ox, robot_oy = 36, 36
+    n_frames = 1 if evento == "terminado" else 8
+    frames = []
+
+    for i in range(n_frames):
+        fase = i / max(n_frames, 1)
+        frame = Image.new("RGB", (ancho, alto), c_fondo)
+        d = ImageDraw.Draw(frame)
+        d.rounded_rectangle([16, 16, ancho - 16, alto - 16], radius=20, fill=c_tarjeta, outline=c_borde, width=1)
+
+        _dibujar_robot(d, robot_ox, robot_oy, escala=0.95, modo=modo_robot, fase=fase)
+
+        timer_txt = _formatear_duracion(transcurrido) if inicio else "00:00"
+        try:
+            bbox_t = d.textbbox((0, 0), timer_txt, font=f_timer)
+            tw_t = bbox_t[2] - bbox_t[0]
+        except Exception:
+            tw_t = 60
+        centro_robot = robot_ox + int(60 * 0.95)
+        # Timer un poco más abajo para no solaparse con el robot que flota
+        d.text((centro_robot - tw_t // 2, robot_oy + int(158 * 0.95) + 10),
+               timer_txt, font=f_timer, fill=c_accent)
+
+        x = 180
+        y = 40
+        d.text((x, y), estado_txt, font=f_titulo, fill=color_estado)
+        y += 30
+        d.text((x, y), etiqueta, font=f_negrita, fill=c_texto)
+        y += 24
+        d.text((x, y), sub, font=f_chico, fill=c_tenue)
+        y += 30
+        barra_x0, barra_x1 = x, ancho - 40
+        barra_y0, barra_y1 = y, y + 16
+        d.rounded_rectangle([barra_x0, barra_y0, barra_x1, barra_y1], radius=8, fill=c_barra_bg)
+        if total and procesados > 0:
+            span = barra_x1 - barra_x0
+            ancho_ok = int(span * (ok / total))
+            ancho_err = int(span * (err / total))
+            if ancho_ok > 0:
+                d.rounded_rectangle([barra_x0, barra_y0, barra_x0 + max(10, ancho_ok), barra_y1], radius=8, fill=c_barra)
+            if ancho_err > 0:
+                x0e = barra_x0 + ancho_ok
+                d.rectangle([x0e, barra_y0, x0e + ancho_err, barra_y1], fill=c_err)
+        y = barra_y1 + 10
+        d.text((x, y), f"{procesados} / {total}    ({pct:.0f}%)", font=f_normal, fill=c_tenue)
+        y += 32
+        gap = 12
+        card_w = (ancho - x - 40 - gap * 2) // 3
+        card_h = 72
+        for j, (label, valor, bg, fg) in enumerate([
+            ("TOTAL", str(total), c_total_bg, c_texto),
+            ("OK", str(ok), c_ok_bg, c_ok),
+            ("ERROR", str(err), c_err_bg, c_err),
+        ]):
+            cx = x + j * (card_w + gap)
+            d.rounded_rectangle([cx, y, cx + card_w, y + card_h], radius=12, fill=bg)
+            try:
+                bb = d.textbbox((0, 0), valor, font=f_stat)
+                tw = bb[2] - bb[0]
+            except Exception:
+                tw = len(valor) * 14
+            d.text((cx + (card_w - tw) // 2, y + 10), valor, font=f_stat, fill=fg)
+            try:
+                bb2 = d.textbbox((0, 0), label, font=f_chico)
+                tw2 = bb2[2] - bb2[0]
+            except Exception:
+                tw2 = len(label) * 7
+            d.text((cx + (card_w - tw2) // 2, y + 46), label, font=f_chico, fill=c_tenue)
+        y += card_h + 16
+        d.rounded_rectangle([x, y, ancho - 40, y + 40], radius=10, fill=(248, 250, 252), outline=c_borde, width=1)
+        d.text((x + 14, y + 11), f"Transcurrido: {_formatear_duracion(transcurrido)}", font=f_normal, fill=c_texto)
+        d.text((x + 280, y + 11), f"Estimado restante: {restante_txt}", font=f_normal, fill=c_tenue)
+
+        frames.append(frame)
 
     buffer = io.BytesIO()
-    img.save(buffer, format="PNG")
+    if len(frames) == 1:
+        frames[0].save(buffer, format="PNG")
+    else:
+        frames[0].save(
+            buffer, format="GIF", save_all=True, append_images=frames[1:],
+            duration=110, loop=0, optimize=False,
+        )
     buffer.seek(0)
     return buffer.read()
+
 
 
 def _texto_tiempo_estimado(info: dict) -> str:
