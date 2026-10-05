@@ -413,6 +413,30 @@ def _es_pregunta_de_estado(texto: str) -> bool:
 # texto: barra de progreso, OK/Error, tiempo estimado.
 # ─────────────────────────────────────────────────────────────
 _CARPETA_FUENTES = Path(__file__).resolve().parent / "fuentes"
+_CARPETA_STATIC = Path(__file__).resolve().parent / "static"
+_LOGO_CACHE = None
+
+
+def _cargar_logo(alto_px=150):
+    """Logo oficial del Extractor (PNG). Se redimensiona manteniendo proporción."""
+    global _LOGO_CACHE
+    ruta = _CARPETA_STATIC / "logo_extractor.png"
+    if not ruta.exists():
+        return None
+    try:
+        if _LOGO_CACHE is None:
+            _LOGO_CACHE = Image.open(ruta).convert("RGBA")
+        logo = _LOGO_CACHE.copy()
+        w, h = logo.size
+        if h <= 0:
+            return None
+        nuevo_h = alto_px
+        nuevo_w = max(1, int(w * (nuevo_h / h)))
+        # LANCZOS = buena calidad al reducir
+        return logo.resize((nuevo_w, nuevo_h), Image.Resampling.LANCZOS)
+    except Exception as e:
+        print(f"[telegram] no se pudo cargar logo: {e}", flush=True)
+        return None
 
 
 def _cargar_fuente(tamano, negrita=False):
@@ -579,8 +603,22 @@ def _generar_imagen_estado(clave_lote: str):
     d = ImageDraw.Draw(img)
     d.rounded_rectangle([18, 18, ancho - 18, alto - 18], radius=22, fill=c_tarjeta, outline=c_borde, width=1)
 
-    robot_ox, robot_oy = 42, 42
-    _dibujar_robot(d, robot_ox, robot_oy, escala=1.05, modo=modo_robot, fase=0.0)
+    # Logo oficial de la app (izquierda)
+    logo = _cargar_logo(alto_px=168)
+    logo_ox, logo_oy = 36, 40
+    if logo is not None:
+        # Pegar con canal alpha sobre el fondo blanco de la tarjeta
+        if logo.mode == "RGBA":
+            img.paste(logo, (logo_ox, logo_oy), logo)
+        else:
+            img.paste(logo, (logo_ox, logo_oy))
+        centro_logo = logo_ox + logo.size[0] // 2
+        base_logo = logo_oy + logo.size[1] + 6
+    else:
+        # Respaldo: robotsito dibujado si falta el archivo del logo
+        _dibujar_robot(d, 42, 42, escala=1.0, modo=modo_robot, fase=0.0)
+        centro_logo = 42 + 60
+        base_logo = 42 + 158 + 6
 
     timer_txt = _formatear_duracion(transcurrido) if inicio else "00:00"
     try:
@@ -588,11 +626,9 @@ def _generar_imagen_estado(clave_lote: str):
         tw_t = bbox_t[2] - bbox_t[0]
     except Exception:
         tw_t = 70
-    centro_robot = robot_ox + int(60 * 1.05)
-    d.text((centro_robot - tw_t // 2, robot_oy + int(158 * 1.05) + 8),
-           timer_txt, font=f_timer, fill=c_accent)
+    d.text((centro_logo - tw_t // 2, base_logo), timer_txt, font=f_timer, fill=c_accent)
 
-    x = 200
+    x = 230
     y = 44
     d.text((x, y), estado_txt, font=f_titulo, fill=color_estado)
     y += 34
