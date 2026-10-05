@@ -276,28 +276,18 @@ def _enviar_a_todos(texto: str):
 
 
 def _enviar_foto(chat_id, contenido_bytes: bytes, texto_pie: str = ""):
-    """Manda la tarjeta de estado. Si es GIF animado usa sendAnimation
-    (el robotsito se mueve); si es PNG, sendPhoto."""
+    """Manda la tarjeta de estado como foto PNG (sendPhoto)."""
     if not TELEGRAM_BOT_TOKEN or not chat_id:
         return
-    es_gif = contenido_bytes[:6] in (b"GIF87a", b"GIF89a")
     try:
-        if es_gif:
-            req_lib.post(
-                f"{API_TELEGRAM}/sendAnimation",
-                data={"chat_id": chat_id, "caption": texto_pie, "parse_mode": "HTML"},
-                files={"animation": ("estado.gif", contenido_bytes, "image/gif")},
-                timeout=30,
-            )
-        else:
-            req_lib.post(
-                f"{API_TELEGRAM}/sendPhoto",
-                data={"chat_id": chat_id, "caption": texto_pie, "parse_mode": "HTML"},
-                files={"photo": ("estado.png", contenido_bytes)},
-                timeout=20,
-            )
+        req_lib.post(
+            f"{API_TELEGRAM}/sendPhoto",
+            data={"chat_id": chat_id, "caption": texto_pie, "parse_mode": "HTML"},
+            files={"photo": ("estado.png", contenido_bytes, "image/png")},
+            timeout=20,
+        )
     except Exception as e:
-        print(f"[telegram] error enviando foto/animación a {chat_id}: {e}", flush=True)
+        print(f"[telegram] error enviando foto a {chat_id}: {e}", flush=True)
 
 
 def _enviar_documento(chat_id, nombre_archivo: str, contenido_bytes: bytes, texto_pie: str = ""):
@@ -522,13 +512,10 @@ def _formatear_duracion(segundos):
 
 
 def _generar_imagen_estado(clave_lote: str):
-    """Genera tarjeta estilo Extractor. En proceso: GIF con robotsito animado.
-    Terminado: PNG estático."""
+    """Genera tarjeta estilo Extractor como PNG de buena calidad (foto estática)."""
     info = LOTES.get(clave_lote)
     if not info:
         return None
-
-    import math
 
     stats = info.get("stats", {})
     total = stats.get("total", 0)
@@ -561,7 +548,8 @@ def _generar_imagen_estado(clave_lote: str):
     else:
         estado_txt, color_estado, modo_robot = "Buscando documentos…", (99, 102, 241), "loading"
 
-    ancho, alto = 860, 420
+    # Un poco más grande para mejor nitidez en Telegram
+    ancho, alto = 960, 460
     c_fondo = (245, 243, 255)
     c_tarjeta = (255, 255, 255)
     c_borde = (226, 232, 240)
@@ -573,12 +561,12 @@ def _generar_imagen_estado(clave_lote: str):
     c_total_bg = (241, 245, 249)
     c_barra_bg, c_barra = (226, 232, 240), (99, 102, 241)
 
-    f_titulo = _cargar_fuente(22, negrita=True)
-    f_negrita = _cargar_fuente(17, negrita=True)
-    f_normal = _cargar_fuente(16)
-    f_chico = _cargar_fuente(13)
-    f_stat = _cargar_fuente(26, negrita=True)
-    f_timer = _cargar_fuente(20, negrita=True)
+    f_titulo = _cargar_fuente(24, negrita=True)
+    f_negrita = _cargar_fuente(18, negrita=True)
+    f_normal = _cargar_fuente(17)
+    f_chico = _cargar_fuente(14)
+    f_stat = _cargar_fuente(28, negrita=True)
+    f_timer = _cargar_fuente(22, negrita=True)
 
     etiqueta = _etiqueta_lote(info)
     fuente = info.get("fuente") or "?"
@@ -587,89 +575,76 @@ def _generar_imagen_estado(clave_lote: str):
     if empresa:
         sub += f"  ·  {empresa}"
 
-    robot_ox, robot_oy = 36, 36
-    n_frames = 1 if evento == "terminado" else 8
-    frames = []
+    img = Image.new("RGB", (ancho, alto), c_fondo)
+    d = ImageDraw.Draw(img)
+    d.rounded_rectangle([18, 18, ancho - 18, alto - 18], radius=22, fill=c_tarjeta, outline=c_borde, width=1)
 
-    for i in range(n_frames):
-        fase = i / max(n_frames, 1)
-        frame = Image.new("RGB", (ancho, alto), c_fondo)
-        d = ImageDraw.Draw(frame)
-        d.rounded_rectangle([16, 16, ancho - 16, alto - 16], radius=20, fill=c_tarjeta, outline=c_borde, width=1)
+    robot_ox, robot_oy = 42, 42
+    _dibujar_robot(d, robot_ox, robot_oy, escala=1.05, modo=modo_robot, fase=0.0)
 
-        _dibujar_robot(d, robot_ox, robot_oy, escala=0.95, modo=modo_robot, fase=fase)
+    timer_txt = _formatear_duracion(transcurrido) if inicio else "00:00"
+    try:
+        bbox_t = d.textbbox((0, 0), timer_txt, font=f_timer)
+        tw_t = bbox_t[2] - bbox_t[0]
+    except Exception:
+        tw_t = 70
+    centro_robot = robot_ox + int(60 * 1.05)
+    d.text((centro_robot - tw_t // 2, robot_oy + int(158 * 1.05) + 8),
+           timer_txt, font=f_timer, fill=c_accent)
 
-        timer_txt = _formatear_duracion(transcurrido) if inicio else "00:00"
+    x = 200
+    y = 44
+    d.text((x, y), estado_txt, font=f_titulo, fill=color_estado)
+    y += 34
+    d.text((x, y), etiqueta, font=f_negrita, fill=c_texto)
+    y += 26
+    d.text((x, y), sub, font=f_chico, fill=c_tenue)
+    y += 32
+    barra_x0, barra_x1 = x, ancho - 44
+    barra_y0, barra_y1 = y, y + 18
+    d.rounded_rectangle([barra_x0, barra_y0, barra_x1, barra_y1], radius=9, fill=c_barra_bg)
+    if total and procesados > 0:
+        span = barra_x1 - barra_x0
+        ancho_ok = int(span * (ok / total))
+        ancho_err = int(span * (err / total))
+        if ancho_ok > 0:
+            d.rounded_rectangle([barra_x0, barra_y0, barra_x0 + max(12, ancho_ok), barra_y1], radius=9, fill=c_barra)
+        if ancho_err > 0:
+            x0e = barra_x0 + ancho_ok
+            d.rectangle([x0e, barra_y0, x0e + ancho_err, barra_y1], fill=c_err)
+    y = barra_y1 + 12
+    d.text((x, y), f"{procesados} / {total}    ({pct:.0f}%)", font=f_normal, fill=c_tenue)
+    y += 34
+    gap = 14
+    card_w = (ancho - x - 44 - gap * 2) // 3
+    card_h = 80
+    for j, (label, valor, bg, fg) in enumerate([
+        ("TOTAL", str(total), c_total_bg, c_texto),
+        ("OK", str(ok), c_ok_bg, c_ok),
+        ("ERROR", str(err), c_err_bg, c_err),
+    ]):
+        cx = x + j * (card_w + gap)
+        d.rounded_rectangle([cx, y, cx + card_w, y + card_h], radius=14, fill=bg)
         try:
-            bbox_t = d.textbbox((0, 0), timer_txt, font=f_timer)
-            tw_t = bbox_t[2] - bbox_t[0]
+            bb = d.textbbox((0, 0), valor, font=f_stat)
+            tw = bb[2] - bb[0]
         except Exception:
-            tw_t = 60
-        centro_robot = robot_ox + int(60 * 0.95)
-        # Timer un poco más abajo para no solaparse con el robot que flota
-        d.text((centro_robot - tw_t // 2, robot_oy + int(158 * 0.95) + 10),
-               timer_txt, font=f_timer, fill=c_accent)
-
-        x = 180
-        y = 40
-        d.text((x, y), estado_txt, font=f_titulo, fill=color_estado)
-        y += 30
-        d.text((x, y), etiqueta, font=f_negrita, fill=c_texto)
-        y += 24
-        d.text((x, y), sub, font=f_chico, fill=c_tenue)
-        y += 30
-        barra_x0, barra_x1 = x, ancho - 40
-        barra_y0, barra_y1 = y, y + 16
-        d.rounded_rectangle([barra_x0, barra_y0, barra_x1, barra_y1], radius=8, fill=c_barra_bg)
-        if total and procesados > 0:
-            span = barra_x1 - barra_x0
-            ancho_ok = int(span * (ok / total))
-            ancho_err = int(span * (err / total))
-            if ancho_ok > 0:
-                d.rounded_rectangle([barra_x0, barra_y0, barra_x0 + max(10, ancho_ok), barra_y1], radius=8, fill=c_barra)
-            if ancho_err > 0:
-                x0e = barra_x0 + ancho_ok
-                d.rectangle([x0e, barra_y0, x0e + ancho_err, barra_y1], fill=c_err)
-        y = barra_y1 + 10
-        d.text((x, y), f"{procesados} / {total}    ({pct:.0f}%)", font=f_normal, fill=c_tenue)
-        y += 32
-        gap = 12
-        card_w = (ancho - x - 40 - gap * 2) // 3
-        card_h = 72
-        for j, (label, valor, bg, fg) in enumerate([
-            ("TOTAL", str(total), c_total_bg, c_texto),
-            ("OK", str(ok), c_ok_bg, c_ok),
-            ("ERROR", str(err), c_err_bg, c_err),
-        ]):
-            cx = x + j * (card_w + gap)
-            d.rounded_rectangle([cx, y, cx + card_w, y + card_h], radius=12, fill=bg)
-            try:
-                bb = d.textbbox((0, 0), valor, font=f_stat)
-                tw = bb[2] - bb[0]
-            except Exception:
-                tw = len(valor) * 14
-            d.text((cx + (card_w - tw) // 2, y + 10), valor, font=f_stat, fill=fg)
-            try:
-                bb2 = d.textbbox((0, 0), label, font=f_chico)
-                tw2 = bb2[2] - bb2[0]
-            except Exception:
-                tw2 = len(label) * 7
-            d.text((cx + (card_w - tw2) // 2, y + 46), label, font=f_chico, fill=c_tenue)
-        y += card_h + 16
-        d.rounded_rectangle([x, y, ancho - 40, y + 40], radius=10, fill=(248, 250, 252), outline=c_borde, width=1)
-        d.text((x + 14, y + 11), f"Transcurrido: {_formatear_duracion(transcurrido)}", font=f_normal, fill=c_texto)
-        d.text((x + 280, y + 11), f"Estimado restante: {restante_txt}", font=f_normal, fill=c_tenue)
-
-        frames.append(frame)
+            tw = len(valor) * 15
+        d.text((cx + (card_w - tw) // 2, y + 12), valor, font=f_stat, fill=fg)
+        try:
+            bb2 = d.textbbox((0, 0), label, font=f_chico)
+            tw2 = bb2[2] - bb2[0]
+        except Exception:
+            tw2 = len(label) * 8
+        d.text((cx + (card_w - tw2) // 2, y + 50), label, font=f_chico, fill=c_tenue)
+    y += card_h + 18
+    d.rounded_rectangle([x, y, ancho - 44, y + 44], radius=12, fill=(248, 250, 252), outline=c_borde, width=1)
+    d.text((x + 16, y + 12), f"Transcurrido: {_formatear_duracion(transcurrido)}", font=f_normal, fill=c_texto)
+    d.text((x + 300, y + 12), f"Estimado restante: {restante_txt}", font=f_normal, fill=c_tenue)
 
     buffer = io.BytesIO()
-    if len(frames) == 1:
-        frames[0].save(buffer, format="PNG")
-    else:
-        frames[0].save(
-            buffer, format="GIF", save_all=True, append_images=frames[1:],
-            duration=110, loop=0, optimize=False,
-        )
+    # PNG sin optimizar de más: buena calidad en Telegram
+    img.save(buffer, format="PNG", compress_level=3)
     buffer.seek(0)
     return buffer.read()
 
