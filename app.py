@@ -1041,28 +1041,8 @@ def recibir_aviso():
 
         _enviar_a_todos(f"{encabezado}\n\n{_texto_estado(clave_lote)}")
 
-        # Si el Extractor adjuntó el Excel de errores (solo lo hace
-        # cuando hubo al menos 1 error -- ver _avisar_telegram en el
-        # Extractor), se reenvía como ARCHIVO real a todos los
-        # registrados, no solo mencionado en el texto. Viene en base64
-        # porque todo el aviso se manda como JSON normal (no
-        # multipart) -- se decodifica aquí antes de reenviarlo.
-        excel_b64 = datos.get("excel_errores_b64")
-        if excel_b64:
-            try:
-                contenido = base64.b64decode(excel_b64)
-                nombre = datos.get("excel_errores_nombre") or f"errores_{clave_lote}.xlsx"
-                _enviar_documento_a_todos(nombre, contenido, f"📎 Excel para reintentar (no descargó nada) — {_etiqueta_lote(info)}")
-            except Exception as e:
-                print(f"[telegram] no se pudo decodificar/enviar el Excel de errores: {e}", flush=True)
-        excel_m_b64 = datos.get("excel_maestro_b64")
-        if excel_m_b64:
-            try:
-                contenido = base64.b64decode(excel_m_b64)
-                nombre = datos.get("excel_maestro_nombre") or f"incompletos_con_maestro_{clave_lote}.xlsx"
-                _enviar_documento_a_todos(nombre, contenido, f"📎 Excel para reintentar (incompletos con maestro en otra empresa) — {_etiqueta_lote(info)}")
-            except Exception as e:
-                print(f"[telegram] no se pudo decodificar/enviar el Excel de incompletos con maestro: {e}", flush=True)
+        # Excel de reintentos deshabilitado (no se generan ni se envían por Telegram)
+
 
     # Oportunista: ya que el servicio está despierto atendiendo este
     # aviso, se aprovecha para revisar TODOS los lotes (no solo este) en
@@ -1155,6 +1135,7 @@ def webhook_telegram():
     mensaje = update.get("message", {})
     chat_id = mensaje.get("chat", {}).get("id")
     texto = (mensaje.get("text") or "").strip().lower()
+    print(f"[webhook] mensaje recibido de {chat_id}: {texto[:50]!r}", flush=True)
 
     if not chat_id:
         # Update sin chat identificable (raro, pero no debe tronar) --

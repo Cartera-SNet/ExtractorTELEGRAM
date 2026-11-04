@@ -120,8 +120,7 @@ distinto en cada una, para identificarlas).
 - Si un lote lleva más de `UMBRAL_ATASCADO_MINUTOS` (por defecto 20) sin reportar
   ningún avance nuevo, el bot avisa que posiblemente se atascó — sin spamear, solo una
   vez por atasco (si se destraba y se vuelve a atascar después, puede avisar de nuevo).
-- Cuando un lote termina con al menos 1 error, el Extractor adjunta el Excel de errores
-  y el bot lo reenvía como archivo real de Telegram, no solo mencionado en el texto.
+- Cuando un lote termina, el bot indica cuántos casos quedaron sin descargar y cuántos incompletos con maestro (sin adjuntar Excel).
 
 ## Notas de seguridad
 
@@ -181,8 +180,7 @@ desde afuera. Además:
 
 ## 7. Avisos nuevos
 El aviso de «Lote terminado» ahora indica el **modo de búsqueda** («solo empresa logueada» o «con maestro»), cuántos
-casos quedaron **sin descargar** y cuántos **incompletos con maestro en otra empresa**, y reenvía como archivos los
-dos Excel para reintentar (formato de la plantilla, listos para volver a cargar).
+casos quedaron **sin descargar** y cuántos **incompletos con maestro en otra empresa**.
 
 ## Pruebas
 ```
