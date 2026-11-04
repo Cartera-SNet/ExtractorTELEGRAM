@@ -130,3 +130,61 @@ distinto en cada una, para identificarlas).
 - El `TELEGRAM_BOT_TOKEN` sí es el de Telegram — trátalo como una contraseña. Si alguna
   vez se expone (por ejemplo, pegado en un chat), regenéralo con BotFather
   (`/token` → `Revoke current token`).
+
+## 6. Órdenes remotas: detener / reanudar / reiniciar desde Telegram
+
+Además de consultar, **cualquier persona que sepa la contraseña de órdenes** puede dar órdenes a un lote:
+
+| Comando (o frase natural) | Qué hace |
+|---|---|
+| `/detener` · «detén el proceso» | Detiene el lote en proceso (terminan los casos en curso; se guarda el avance). |
+| `/reanudar` · `/iniciar` · «reanuda el proceso» | Retoma el lote detenido donde quedó, con los mismos ajustes con que arrancó. |
+| `/reiniciar` · «reinicia el proceso» | Lo detiene, espera a que terminen los casos en curso y lo reanuda. |
+
+Si hay varios lotes pregunta cuál; luego pide confirmar con un botón y, por último, la **contraseña** (los administradores de `TELEGRAM_ADMIN_IDS` no la necesitan). El bot borra el mensaje donde escribiste la contraseña.
+
+### Cómo funciona (y por qué es seguro)
+El Extractor corre en cada PC, detrás de su red, así que el bot **no** puede llamarlo. En cambio el
+Extractor **pregunta** al bot cada ~10 s si hay órdenes para su `FUENTE_EXTRACTOR` (`POST /comandos`), la
+ejecuta y reporta el resultado (`POST /comandos/resultado`), que te llega por Telegram. Nada entra al PC
+desde afuera. Además:
+
+- Hace falta la contraseña (`TELEGRAM_CLAVE_ORDENES`, definida solo en Railway, nunca en el código) o estar en `TELEGRAM_ADMIN_IDS`. Con 3 contraseñas incorrectas seguidas se cancela la orden y esa persona queda bloqueada 15 min (`MAX_INTENTOS_CLAVE`, `BLOQUEO_CLAVE_SEG`). Quien no tiene permiso ni contraseña recibe su `chat_id`.
+- La orden solo la recoge quien conozca `TELEGRAM_AVISO_TOKEN`.
+- Una orden que el Extractor no recoge en `VIGENCIA_ORDEN_SEG` (600 s) se descarta: nunca se ejecuta algo viejo.
+- Con `TELEGRAM_WEBHOOK_SECRET` definido, el bot rechaza mensajes que no vengan de Telegram.
+
+### Variables nuevas en el bot
+| Variable | Valor |
+|---|---|
+| `TELEGRAM_CLAVE_ORDENES` | **La contraseña general** para dar órdenes (cualquiera que la sepa puede, sin importar su chat_id). Si no se define, solo los administradores pueden. |
+| `TELEGRAM_ADMIN_IDS` | (opcional) chat_id, separados por coma, de quienes **no necesitan escribir la contraseña**. Si no se define, solo vale `TELEGRAM_CHAT_ID`. Quita tu id de aquí si quieres que hasta tú tengas que escribirla. |
+| `TELEGRAM_WEBHOOK_SECRET` | **Recomendado.** Una clave inventada. Después de definirla, vuelve a abrir `/configurar-webhook` para registrarla en Telegram. |
+| `VIGENCIA_ORDEN_SEG` | (opcional) segundos que una orden espera ser recogida. Por defecto 600. |
+
+### Variables nuevas en el Extractor (opcionales)
+`EXTRACTOR_ORDENES_CADA_SEG` (cada cuántos segundos pregunta al bot; 10 por defecto) y
+`EXTRACTOR_REINICIO_ESPERA_MIN` (cuánto espera `/reiniciar` a que terminen los casos en curso; 15 por defecto).
+
+### Límites a tener presentes
+- **Reanudar/reiniciar solo funciona mientras el Extractor siga abierto con la sesión iniciada** (los datos del
+  lote y la sesión viven en memoria). Si se cerró, el bot lo informa y hay que iniciar desde la pantalla.
+  Si la sesión tiene más de ~7 h puede haber vencido: los casos darían error de sesión.
+- **No se puede iniciar un lote nuevo** desde Telegram (necesita el Excel de casos).
+- Si el PC está apagado o sin internet, la orden no se recoge y vence a los 10 min.
+
+### Al actualizar el bot
+1. Sube la carpeta a Railway (o haz push al repo).
+2. Define `TELEGRAM_ADMIN_IDS` (y, recomendado, `TELEGRAM_WEBHOOK_SECRET`).
+3. Abre de nuevo `https://tu-bot.up.railway.app/configurar-webhook` (registra el secreto y el menú con los comandos nuevos).
+4. El Extractor debe ser la versión nueva (la que pregunta por órdenes).
+
+## 7. Avisos nuevos
+El aviso de «Lote terminado» ahora indica el **modo de búsqueda** («solo empresa logueada» o «con maestro»), cuántos
+casos quedaron **sin descargar** y cuántos **incompletos con maestro en otra empresa**, y reenvía como archivos los
+dos Excel para reintentar (formato de la plantilla, listos para volver a cargar).
+
+## Pruebas
+```
+python -m unittest discover -s tests -v
+```

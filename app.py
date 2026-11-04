@@ -38,6 +38,7 @@ import io
 import json
 import time
 import base64
+import uuid
 import threading
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
@@ -62,6 +63,25 @@ UMBRAL_ERRORES_ALERTA = float(os.environ.get("UMBRAL_ERRORES_ALERTA", "20"))
 # noticias, algo probablemente se congeló (red caída, Tesseract
 # colgado, etc.) en vez de seguir avanzando en silencio.
 UMBRAL_ATASCADO_MINUTOS = float(os.environ.get("UMBRAL_ATASCADO_MINUTOS", "20"))
+
+# ── Órdenes remotas (detener / reanudar / reiniciar un lote desde Telegram) ──
+# Solo las personas listadas aquí pueden dar órdenes (el resto sigue pudiendo CONSULTAR).
+# Si TELEGRAM_ADMIN_IDS no se define, solo vale el dueño: TELEGRAM_CHAT_ID.
+TELEGRAM_ADMIN_IDS = {x.strip() for x in os.environ.get("TELEGRAM_ADMIN_IDS", "").split(",") if x.strip()}
+if not TELEGRAM_ADMIN_IDS and TELEGRAM_CHAT_ID:
+    TELEGRAM_ADMIN_IDS = {str(TELEGRAM_CHAT_ID).strip()}
+# Contraseña general para las órdenes: cualquier persona que escriba al bot puede pedir una orden
+# si sabe esta clave (no hace falta estar en TELEGRAM_ADMIN_IDS). Se define SOLO en Railway
+# (nunca va en el código). Quienes estén en TELEGRAM_ADMIN_IDS NO necesitan escribirla.
+TELEGRAM_CLAVE_ORDENES = os.environ.get("TELEGRAM_CLAVE_ORDENES", "")
+MAX_INTENTOS_CLAVE = int(os.environ.get("MAX_INTENTOS_CLAVE", "3"))     # fallos seguidos antes de bloquear
+BLOQUEO_CLAVE_SEG = int(os.environ.get("BLOQUEO_CLAVE_SEG", "900"))     # 15 min de bloqueo
+VIGENCIA_CLAVE_SEG = int(os.environ.get("VIGENCIA_CLAVE_SEG", "180"))   # tiempo para escribir la clave
+# Recomendado: una clave inventada; Telegram la manda en cada mensaje y así nadie puede
+# "falsificar" mensajes al webhook (importante ahora que hay órdenes). Si no se define, no se exige.
+TELEGRAM_WEBHOOK_SECRET = os.environ.get("TELEGRAM_WEBHOOK_SECRET", "")
+# Una orden que el Extractor no recoge en este tiempo se descarta (no se ejecuta algo viejo).
+VIGENCIA_ORDEN_SEG = int(os.environ.get("VIGENCIA_ORDEN_SEG", "600"))
 
 API_TELEGRAM = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 
@@ -123,6 +143,7 @@ MAX_HISTORIAL = 500
 ARCHIVO_ESTADO = Path(__file__).resolve().parent / "estado_lotes.json"
 ARCHIVO_USUARIOS = Path(__file__).resolve().parent / "usuarios_registrados.json"
 ARCHIVO_HISTORIAL = Path(__file__).resolve().parent / "historial_terminados.json"
+ARCHIVO_ORDENES = Path(__file__).resolve().parent / "ordenes_remotas.json"
 
 
 def _cargar_estado_disco():
@@ -344,6 +365,9 @@ def _configurar_comandos():
         {"command": "resumen", "description": "Balance de todos los lotes terminados hoy"},
         {"command": "quien", "description": "Qué PCs tienen un proceso activo ahora"},
         {"command": "eliminar", "description": "Borrar de la lista un lote ya terminado"},
+        {"command": "detener", "description": "Detener un lote en proceso (pide contraseña)"},
+        {"command": "reanudar", "description": "Reanudar un lote detenido (pide contraseña)"},
+        {"command": "reiniciar", "description": "Detener y reanudar un lote (pide contraseña)"},
         {"command": "help", "description": "Ver qué le puedes preguntar a este bot"},
     ]
     try:
@@ -768,6 +792,13 @@ def _texto_estado(clave_lote: str) -> str:
 
     lineas.append(f"Avance: {procesados} / {total} ({pct}%)")
     lineas.append(f"OK: {ok} · Error: {err}")
+    if info.get("modo_busqueda"):
+        lineas.append(f"Búsqueda: {info['modo_busqueda']}")
+    if info.get("evento") == "terminado" and (info.get("sin_descargar") or info.get("incompletos_maestro")):
+        lineas.append(
+            f"Para reintentar: {info.get('sin_descargar', 0)} sin descargar nada · "
+            f"{info.get('incompletos_maestro', 0)} incompletos con maestro en otra empresa"
+        )
     if info.get("evento") != "terminado":
         texto_eta = _texto_tiempo_estimado(info)
         if texto_eta:
@@ -1021,9 +1052,17 @@ def recibir_aviso():
             try:
                 contenido = base64.b64decode(excel_b64)
                 nombre = datos.get("excel_errores_nombre") or f"errores_{clave_lote}.xlsx"
-                _enviar_documento_a_todos(nombre, contenido, f"📎 Excel de errores — {_etiqueta_lote(info)}")
+                _enviar_documento_a_todos(nombre, contenido, f"📎 Excel para reintentar (no descargó nada) — {_etiqueta_lote(info)}")
             except Exception as e:
                 print(f"[telegram] no se pudo decodificar/enviar el Excel de errores: {e}", flush=True)
+        excel_m_b64 = datos.get("excel_maestro_b64")
+        if excel_m_b64:
+            try:
+                contenido = base64.b64decode(excel_m_b64)
+                nombre = datos.get("excel_maestro_nombre") or f"incompletos_con_maestro_{clave_lote}.xlsx"
+                _enviar_documento_a_todos(nombre, contenido, f"📎 Excel para reintentar (incompletos con maestro en otra empresa) — {_etiqueta_lote(info)}")
+            except Exception as e:
+                print(f"[telegram] no se pudo decodificar/enviar el Excel de incompletos con maestro: {e}", flush=True)
 
     # Oportunista: ya que el servicio está despierto atendiendo este
     # aviso, se aprovecha para revisar TODOS los lotes (no solo este) en
@@ -1038,6 +1077,10 @@ def recibir_aviso():
 # ─────────────────────────────────────────────────────────────
 @app.route("/webhook", methods=["POST"])
 def webhook_telegram():
+    # Con TELEGRAM_WEBHOOK_SECRET definido, solo se aceptan mensajes que traigan el secreto que
+    # Telegram adjunta (lo registra /configurar-webhook). Evita mensajes falsificados.
+    if TELEGRAM_WEBHOOK_SECRET and request.headers.get("X-Telegram-Bot-Api-Secret-Token") != TELEGRAM_WEBHOOK_SECRET:
+        return jsonify({"ok": False, "error": "no autorizado"}), 403
     update = request.get_json(silent=True) or {}
 
     # Clic en un botón ("¿cuál lote?") -- responde al chat de quien le
@@ -1049,6 +1092,11 @@ def webhook_telegram():
         if chat_id:
             _registrar_usuario(chat_id)
         _responder_callback(cq["id"])
+
+        if data.startswith(("ord:", "okord:")) or data == "cancelar-orden":
+            if chat_id:
+                _manejar_callback_orden(chat_id, data)
+            return jsonify({"ok": True})
 
         # El prefijo decide la acción:
         #   "ver:<clave>"            -> botones de /estado (ya existía)
@@ -1118,6 +1166,21 @@ def webhook_telegram():
     # "lote terminado" push).
     es_nuevo = _registrar_usuario(chat_id)
 
+    if _tiene_clave_pendiente(chat_id):
+        if texto.startswith("/"):                      # escribió otro comando: se abandona la orden
+            _cancelar_clave_pendiente(chat_id)
+            if texto.startswith("/cancelar"):
+                _enviar_mensaje(chat_id, "De acuerdo, no se envió ninguna orden.")
+                return jsonify({"ok": True})
+        else:
+            _procesar_intento_clave(chat_id, (mensaje.get("text") or "").strip(), mensaje.get("message_id"))
+            return jsonify({"ok": True})
+
+    orden_pedida = _detectar_orden(texto)
+    if orden_pedida:
+        _iniciar_flujo_orden(chat_id, orden_pedida)
+        return jsonify({"ok": True})
+
     if texto in _PALABRAS_CLAVE_AYUDA or _coincide_alguna(texto, _PALABRAS_CLAVE_AYUDA):
         saludo_registro = (
             "✅ Quedaste registrado -- de ahora en más te aviso automáticamente "
@@ -1140,6 +1203,11 @@ def webhook_telegram():
             "es un gráfico generado con los mismos datos).\n"
             "• \"elimina el lote\" — borra de la lista un lote ya terminado, "
             "pidiendo confirmación antes (/eliminar).\n\n"
+            "<b>Órdenes (piden contraseña)</b>:\n"
+            "• /detener — detiene un lote en proceso.\n"
+            "• /reanudar — retoma un lote detenido donde quedó.\n"
+            "• /reiniciar — lo detiene y lo reanuda.\n"
+            "Siempre pido confirmación con un botón y luego la contraseña de órdenes.\n\n"
             "También te aviso <b>sin que preguntes nada</b> (a todos los registrados) "
             "cuando un lote <b>inicia</b> o <b>termina</b> (con alerta si hubo muchos errores), "
             "si se borró el progreso, o si un lote lleva mucho tiempo sin reportar avance."
@@ -1201,6 +1269,308 @@ def webhook_telegram():
 
 
 # ─────────────────────────────────────────────────────────────
+# Órdenes remotas: detener / reanudar / reiniciar un lote desde Telegram
+# ─────────────────────────────────────────────────────────────
+# Cómo funciona: el Extractor corre en cada PC (detrás de su red), así que este bot NO
+# puede llamarlo directamente. Por eso se usa una COLA: el bot guarda la orden y el
+# Extractor -- que ya habla con el bot -- la consulta cada ~10 s (POST /comandos),
+# la ejecuta y reporta el resultado (POST /comandos/resultado). Nada entra al PC desde afuera.
+#
+# Seguridad: (1) solo TELEGRAM_ADMIN_IDS pueden pedir órdenes; (2) siempre se pide
+# confirmar con un botón; (3) la orden solo la recoge quien conozca TELEGRAM_AVISO_TOKEN;
+# (4) una orden no recogida en VIGENCIA_ORDEN_SEG se descarta.
+ORDENES = {}   # id -> {id, comando, fuente, clave_lote, pedido_por, ts, estado, mensaje}
+ETIQUETA_ORDEN = {"d": "detener", "r": "reanudar", "x": "reiniciar"}
+NOMBRE_ORDEN = {"detener": "DETENER", "reanudar": "REANUDAR", "reiniciar": "REINICIAR (detener y reanudar)"}
+
+_PALABRAS_DETENER = ("/detener", "/parar", "detener el proceso", "detén el proceso", "deten el proceso",
+                     "detener el lote", "detén el lote", "deten el lote", "para el proceso", "parar el proceso",
+                     "para el lote", "parar el lote", "frena el proceso")
+_PALABRAS_REANUDAR = ("/reanudar", "/continuar", "/iniciar", "reanuda el proceso", "reanudar el proceso",
+                      "continúa el proceso", "continua el proceso", "reanuda el lote", "reanudar el lote",
+                      "inicia de nuevo", "iniciar de nuevo", "arranca de nuevo")
+_PALABRAS_REINICIAR = ("/reiniciar", "reinicia el proceso", "reiniciar el proceso", "reinicia el lote", "reiniciar el lote")
+
+
+def _cargar_ordenes_disco():
+    try:
+        if ARCHIVO_ORDENES.exists():
+            ORDENES.update(json.loads(ARCHIVO_ORDENES.read_text(encoding="utf-8")))
+    except Exception as e:
+        print(f"[telegram] no se pudieron cargar las órdenes: {e}", flush=True)
+
+
+def _guardar_ordenes_disco():
+    try:
+        recientes = {k: v for k, v in ORDENES.items() if time.time() - v.get("ts", 0) < 86400}
+        ARCHIVO_ORDENES.write_text(json.dumps(recientes, ensure_ascii=False), encoding="utf-8")
+    except Exception as e:
+        print(f"[telegram] no se pudieron guardar las órdenes: {e}", flush=True)
+
+
+_cargar_ordenes_disco()
+
+
+def _es_admin(chat_id) -> bool:
+    return str(chat_id) in TELEGRAM_ADMIN_IDS
+
+
+def _puede_ordenar(chat_id) -> bool:
+    """Puede iniciar el flujo de una orden: es administrador, o hay una contraseña general definida."""
+    return _es_admin(chat_id) or bool(TELEGRAM_CLAVE_ORDENES)
+
+
+# ── Contraseña de las órdenes: estado por chat ──────────────────
+ESPERA_CLAVE = {}   # chat_id -> {comando, clave_lote, ts}   (orden confirmada, falta escribir la clave)
+INTENTOS_CLAVE = {}  # chat_id -> {"n": fallos seguidos, "hasta": timestamp de fin de bloqueo}
+
+
+def _segundos_bloqueado(chat_id) -> int:
+    est = INTENTOS_CLAVE.get(str(chat_id))
+    if est and est.get("hasta", 0) > time.time():
+        return int(est["hasta"] - time.time()) + 1
+    return 0
+
+
+def _tiene_clave_pendiente(chat_id) -> bool:
+    pend = ESPERA_CLAVE.get(str(chat_id))
+    if not pend:
+        return False
+    if time.time() - pend["ts"] > VIGENCIA_CLAVE_SEG:
+        ESPERA_CLAVE.pop(str(chat_id), None)
+        return False
+    return True
+
+
+def _cancelar_clave_pendiente(chat_id):
+    ESPERA_CLAVE.pop(str(chat_id), None)
+
+
+def _pedir_clave(chat_id, comando: str, clave_lote: str):
+    espera = _segundos_bloqueado(chat_id)
+    if espera:
+        _enviar_mensaje(chat_id, f"🔒 Demasiados intentos fallidos. Intenta de nuevo en {espera // 60 + 1} min.")
+        return
+    ESPERA_CLAVE[str(chat_id)] = {"comando": comando, "clave_lote": clave_lote, "ts": time.time()}
+    _enviar_mensaje(
+        chat_id,
+        f"🔑 Escribe la <b>contraseña</b> para enviar la orden <b>{NOMBRE_ORDEN[comando]}</b> "
+        f"(tienes {VIGENCIA_CLAVE_SEG // 60} min; borro tu mensaje apenas la lea). "
+        f"Para cancelar, escribe /cancelar."
+    )
+
+
+def _borrar_mensaje(chat_id, message_id):
+    """Borra el mensaje con la contraseña del chat (mejor esfuerzo): que no quede escrita en el historial."""
+    if not (TELEGRAM_BOT_TOKEN and message_id):
+        return
+    try:
+        req_lib.post(f"{API_TELEGRAM}/deleteMessage", json={"chat_id": chat_id, "message_id": message_id}, timeout=10)
+    except Exception as e:
+        print(f"[telegram] no se pudo borrar el mensaje con la clave: {e}", flush=True)
+
+
+def _procesar_intento_clave(chat_id, texto_original: str, message_id):
+    """El chat tenía una orden esperando contraseña y escribió algo: ¿es la clave?"""
+    import hmac
+    clave_chat = str(chat_id)
+    espera = _segundos_bloqueado(chat_id)
+    if espera:
+        _cancelar_clave_pendiente(chat_id)
+        _borrar_mensaje(chat_id, message_id)
+        _enviar_mensaje(chat_id, f"🔒 Demasiados intentos fallidos. Intenta de nuevo en {espera // 60 + 1} min.")
+        return
+    pend = ESPERA_CLAVE.get(clave_chat)
+    _borrar_mensaje(chat_id, message_id)            # SIEMPRE se borra lo que escribió (puede ser la clave)
+    if hmac.compare_digest(texto_original.encode("utf-8"), TELEGRAM_CLAVE_ORDENES.encode("utf-8")) and TELEGRAM_CLAVE_ORDENES:
+        INTENTOS_CLAVE.pop(clave_chat, None)
+        _cancelar_clave_pendiente(chat_id)
+        if not LOTES.get(pend["clave_lote"]):
+            _enviar_mensaje(chat_id, "Ese lote ya no está en la lista.")
+            return
+        _encolar_y_avisar(chat_id, pend["comando"], pend["clave_lote"])
+        return
+    est = INTENTOS_CLAVE.setdefault(clave_chat, {"n": 0, "hasta": 0})
+    est["n"] += 1
+    if est["n"] >= MAX_INTENTOS_CLAVE:
+        est["n"] = 0
+        est["hasta"] = time.time() + BLOQUEO_CLAVE_SEG
+        _cancelar_clave_pendiente(chat_id)
+        _enviar_mensaje(chat_id, f"🔒 Contraseña incorrecta {MAX_INTENTOS_CLAVE} veces. Orden cancelada y bloqueado {BLOQUEO_CLAVE_SEG // 60} min.")
+    else:
+        _enviar_mensaje(chat_id, f"❌ Contraseña incorrecta ({est['n']}/{MAX_INTENTOS_CLAVE}). Inténtalo de nuevo o escribe /cancelar.")
+
+
+def _detectar_orden(texto: str):
+    """'detener' | 'reanudar' | 'reiniciar' | None, según el texto (ya en minúsculas)."""
+    if _coincide_alguna(texto, _PALABRAS_REINICIAR):
+        return "reiniciar"
+    if _coincide_alguna(texto, _PALABRAS_DETENER):
+        return "detener"
+    if _coincide_alguna(texto, _PALABRAS_REANUDAR):
+        return "reanudar"
+    return None
+
+
+def _lotes_para_orden(comando: str) -> dict:
+    """Lotes a los que tiene sentido darle esa orden: detener -> los que siguen en proceso;
+    reanudar/reiniciar -> cualquiera reciente (típicamente uno detenido)."""
+    activos = _lotes_activos_recientes()
+    if comando == "detener":
+        return {c: i for c, i in activos.items() if i.get("evento") != "terminado"}
+    return activos
+
+
+def _clave_corta(comando: str) -> str:
+    return {v: k for k, v in ETIQUETA_ORDEN.items()}[comando]
+
+
+def _iniciar_flujo_orden(chat_id, comando: str):
+    if not _puede_ordenar(chat_id):
+        _enviar_mensaje(
+            chat_id,
+            "🔒 Las órdenes (detener / reanudar / reiniciar) no están habilitadas para ti. "
+            "Tú sí puedes consultar con /estado.\n\n"
+            f"Tu chat_id es <code>{chat_id}</code> — pídele al administrador que defina la contraseña de "
+            "órdenes (<code>TELEGRAM_CLAVE_ORDENES</code>) o que agregue tu chat_id a "
+            "<code>TELEGRAM_ADMIN_IDS</code>."
+        )
+        return
+    if _segundos_bloqueado(chat_id) and not _es_admin(chat_id):
+        _enviar_mensaje(chat_id, f"🔒 Demasiados intentos fallidos. Intenta de nuevo en {_segundos_bloqueado(chat_id) // 60 + 1} min.")
+        return
+    candidatos = _lotes_para_orden(comando)
+    if not candidatos:
+        _enviar_mensaje(chat_id, {
+            "detener": "No hay ningún lote en proceso que detener ahora mismo.",
+        }.get(comando, "No tengo ningún lote reciente al que darle esa orden."))
+        return
+    if len(candidatos) == 1:
+        (clave,) = candidatos.keys()
+        _pedir_confirmacion_orden(chat_id, comando, clave)
+        return
+    botones = [(_etiqueta_lote(i) + f" · {i.get('fuente', '?')}", f"ord:{_clave_corta(comando)}:{c}") for c, i in candidatos.items()]
+    _enviar_mensaje(chat_id, f"¿Cuál lote quieres {comando}?", botones=botones)
+
+
+def _pedir_confirmacion_orden(chat_id, comando: str, clave_lote: str):
+    info = LOTES.get(clave_lote)
+    if not info:
+        _enviar_mensaje(chat_id, "Ese lote ya no está en la lista.")
+        return
+    extra = ""
+    if comando in ("reanudar", "reiniciar"):
+        extra = ("\n\nSe retoma donde quedó: los casos ya resueltos no se vuelven a procesar. "
+                 "Solo funciona si el Extractor de ese PC sigue abierto con la sesión iniciada.")
+    if comando in ("detener", "reiniciar"):
+        extra += "\n\nLos casos que ya están en curso terminan; se guarda el avance."
+    _enviar_mensaje(
+        chat_id,
+        f"¿Seguro que quieres <b>{NOMBRE_ORDEN[comando]}</b> este lote?\n\n"
+        f"<b>{_etiqueta_lote(info)}</b>\nFuente: {info.get('fuente', '?')}{extra}",
+        botones=[("✅ Sí, enviar la orden", f"okord:{_clave_corta(comando)}:{clave_lote}"), ("❌ No, cancelar", "cancelar-orden")],
+    )
+
+
+def _crear_orden(comando: str, clave_lote: str, chat_id):
+    info = LOTES.get(clave_lote) or {}
+    orden = {
+        "id": uuid.uuid4().hex[:8], "comando": comando, "fuente": info.get("fuente", ""),
+        "clave_lote": clave_lote, "pedido_por": str(chat_id), "ts": time.time(),
+        "estado": "pendiente", "mensaje": "",
+    }
+    with LOCK:
+        ORDENES[orden["id"]] = orden
+        _guardar_ordenes_disco()
+    return orden
+
+
+def _manejar_callback_orden(chat_id, data: str):
+    if data == "cancelar-orden":
+        _enviar_mensaje(chat_id, "De acuerdo, no se envió ninguna orden.")
+        return
+    if not _puede_ordenar(chat_id):
+        _enviar_mensaje(chat_id, "🔒 Las órdenes no están habilitadas para ti.")
+        return
+    try:
+        prefijo, corta, clave_lote = data.split(":", 2)
+        comando = ETIQUETA_ORDEN[corta]
+    except Exception:
+        _enviar_mensaje(chat_id, "No entendí esa opción.")
+        return
+    if prefijo == "ord":      # eligió el lote -> falta confirmar
+        _pedir_confirmacion_orden(chat_id, comando, clave_lote)
+        return
+    # prefijo == "okord": confirmado
+    if not LOTES.get(clave_lote):
+        _enviar_mensaje(chat_id, "Ese lote ya no está en la lista.")
+        return
+    if _es_admin(chat_id):                 # los administradores no necesitan escribir la contraseña
+        _encolar_y_avisar(chat_id, comando, clave_lote)
+    else:
+        _pedir_clave(chat_id, comando, clave_lote)
+
+
+def _encolar_y_avisar(chat_id, comando: str, clave_lote: str):
+    orden = _crear_orden(comando, clave_lote, chat_id)
+    _enviar_mensaje(
+        chat_id,
+        f"📨 Orden <b>{NOMBRE_ORDEN[comando]}</b> enviada a <b>{orden['fuente'] or '?'}</b>.\n"
+        f"El Extractor la recoge en unos segundos (hasta ~15 s) y te aviso cuando la ejecute. "
+        f"Si no responde en {VIGENCIA_ORDEN_SEG // 60} min, se descarta."
+    )
+
+
+@app.route("/comandos", methods=["POST"])
+def entregar_comandos():
+    """Lo llama el EXTRACTOR cada pocos segundos: devuelve las órdenes pendientes de SU fuente."""
+    datos = request.get_json(silent=True) or {}
+    if TELEGRAM_AVISO_TOKEN and datos.get("token") != TELEGRAM_AVISO_TOKEN:
+        return jsonify({"ok": False, "error": "token inválido"}), 403
+    fuente = datos.get("fuente", "")
+    ahora = time.time()
+    entregar = []
+    with LOCK:
+        for o in ORDENES.values():
+            if o["estado"] != "pendiente":
+                continue
+            if ahora - o["ts"] > VIGENCIA_ORDEN_SEG:
+                o["estado"] = "vencida"
+                o["mensaje"] = "El Extractor no la recogió a tiempo."
+                continue
+            if o["fuente"] == fuente:
+                o["estado"] = "entregada"
+                entregar.append({k: o[k] for k in ("id", "comando", "clave_lote")})
+        if entregar:
+            _guardar_ordenes_disco()
+    return jsonify({"ok": True, "comandos": entregar})
+
+
+@app.route("/comandos/resultado", methods=["POST"])
+def resultado_comando():
+    """El Extractor reporta qué pasó con una orden; se le avisa a quien la pidió (y a los demás admins)."""
+    datos = request.get_json(silent=True) or {}
+    if TELEGRAM_AVISO_TOKEN and datos.get("token") != TELEGRAM_AVISO_TOKEN:
+        return jsonify({"ok": False, "error": "token inválido"}), 403
+    with LOCK:
+        o = ORDENES.get(datos.get("id", ""))
+        if not o:
+            return jsonify({"ok": False, "error": "orden desconocida"}), 404
+        ok = bool(datos.get("ok"))
+        o["estado"] = "ejecutada" if ok else "fallida"
+        o["mensaje"] = str(datos.get("mensaje", ""))[:500]
+        copia = dict(o)
+        _guardar_ordenes_disco()
+    icono = "✅" if ok else "❌"
+    texto = (f"{icono} <b>{NOMBRE_ORDEN.get(copia['comando'], copia['comando'])}</b> — {copia['fuente']}\n"
+             f"{copia['mensaje']}")
+    destinos = {copia["pedido_por"]} | set(TELEGRAM_ADMIN_IDS)
+    for d in destinos:
+        _enviar_mensaje(d, texto)
+    return jsonify({"ok": True})
+
+
+# ─────────────────────────────────────────────────────────────
 # Endpoints de salud / configuración
 # ─────────────────────────────────────────────────────────────
 @app.route("/")
@@ -1232,7 +1602,10 @@ def configurar_webhook():
     host_sin_protocolo = request.url_root.split("://", 1)[-1].rstrip("/")
     url_publica = f"https://{host_sin_protocolo}/webhook"
     try:
-        resp = req_lib.post(f"{API_TELEGRAM}/setWebhook", json={"url": url_publica}, timeout=10)
+        cuerpo_webhook = {"url": url_publica}
+        if TELEGRAM_WEBHOOK_SECRET:
+            cuerpo_webhook["secret_token"] = TELEGRAM_WEBHOOK_SECRET
+        resp = req_lib.post(f"{API_TELEGRAM}/setWebhook", json=cuerpo_webhook, timeout=10)
         _configurar_comandos()
         return jsonify({"ok": True, "webhook_configurado_en": url_publica, "respuesta_telegram": resp.json()})
     except Exception as e:
