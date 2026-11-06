@@ -1021,6 +1021,37 @@ def recibir_aviso():
             f"Te aviso cuando termine (o si se atasca). También puedes escribir /estado."
         )
 
+    # Avisos de sesión / token (el Extractor los manda al renovar o pausar)
+    _evt_token = (datos.get("evento") or "").strip()
+    if _evt_token in ("token_renovado", "token_pausa", "token_reanudado", "token_error", "token_aviso"):
+        _msg = (datos.get("mensaje") or "").strip()
+        _etiq = _etiqueta_lote(info) if info else (clave_lote or "—")
+        _fuente = datos.get("fuente") or (info or {}).get("fuente") or "?"
+        _iconos = {
+            "token_renovado": "🔄",
+            "token_pausa": "⏸",
+            "token_reanudado": "▶",
+            "token_error": "⚠️",
+            "token_aviso": "⏳",
+        }
+        _titulos = {
+            "token_renovado": "Token renovado",
+            "token_pausa": "Lote en pausa (sesión)",
+            "token_reanudado": "Sesión restablecida",
+            "token_error": "Error al renovar token",
+            "token_aviso": "Token por vencer",
+        }
+        _icon = _iconos.get(_evt_token, "ℹ️")
+        _titulo = _titulos.get(_evt_token, "Sesión")
+        if not _msg:
+            _msg = _titulo
+        _enviar_a_todos(
+            f"{_icon} <b>{_titulo}</b>\n\n"
+            f"<b>{_etiq}</b>\n"
+            f"Fuente: {_fuente}\n\n"
+            f"{_msg}"
+        )
+
     # Aviso AUTOMÁTICO cuando el lote termina -- sin que el usuario
     # tenga que preguntar nada.
     if datos.get("evento") == "terminado":
